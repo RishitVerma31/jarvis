@@ -33,6 +33,8 @@ export function useSpeechSynthesis() {
   const [isSpeaking, setIsSpeaking] = useState(false);
   const [availableVoices, setAvailableVoices] = useState<SpeechSynthesisVoice[]>([]);
   const selectedVoiceRef = useRef<SpeechSynthesisVoice | null>(null);
+  const activeUtteranceRef = useRef<SpeechSynthesisUtterance | null>(null);
+  const fallbackTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Load and pick Jarvis voice
   useEffect(() => {
@@ -65,15 +67,34 @@ export function useSpeechSynthesis() {
     window.speechSynthesis.onvoiceschanged = loadVoices;
 
     return () => {
-      if ('speechSynthesis' in window) {
-        window.speechSynthesis.cancel();
+      if (fallbackTimerRef.current) {
+        clearTimeout(fallbackTimerRef.current);
+      }
+      if (typeof window !== 'undefined') {
+        (window as unknown as { __jarvis_active_utterance: SpeechSynthesisUtterance | null }).__jarvis_active_utterance = null;
+        if ('speechSynthesis' in window) {
+          window.speechSynthesis.cancel();
+        }
       }
     };
   }, []);
 
   const stopSpeaking = useCallback(() => {
-    if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
-      window.speechSynthesis.cancel();
+    if (fallbackTimerRef.current) {
+      clearTimeout(fallbackTimerRef.current);
+      fallbackTimerRef.current = null;
+    }
+    if (activeUtteranceRef.current) {
+      activeUtteranceRef.current.onstart = null;
+      activeUtteranceRef.current.onend = null;
+      activeUtteranceRef.current.onerror = null;
+      activeUtteranceRef.current = null;
+    }
+    if (typeof window !== 'undefined') {
+      (window as unknown as { __jarvis_active_utterance: SpeechSynthesisUtterance | null }).__jarvis_active_utterance = null;
+      if ('speechSynthesis' in window) {
+        window.speechSynthesis.cancel();
+      }
     }
     setIsSpeaking(false);
   }, []);
@@ -91,10 +112,29 @@ export function useSpeechSynthesis() {
         return;
       }
 
+      // Clear any pending timer or previous utterance handlers
+      if (fallbackTimerRef.current) {
+        clearTimeout(fallbackTimerRef.current);
+        fallbackTimerRef.current = null;
+      }
+
+      if (activeUtteranceRef.current) {
+        activeUtteranceRef.current.onstart = null;
+        activeUtteranceRef.current.onend = null;
+        activeUtteranceRef.current.onerror = null;
+        activeUtteranceRef.current = null;
+      }
+
       // Cancel any ongoing speech
       window.speechSynthesis.cancel();
 
       const utterance = new SpeechSynthesisUtterance(cleanText);
+
+      // Retain active utterance reference to prevent Chromium V8 garbage-collection bug
+      activeUtteranceRef.current = utterance;
+      if (typeof window !== 'undefined') {
+        (window as unknown as { __jarvis_active_utterance: SpeechSynthesisUtterance | null }).__jarvis_active_utterance = utterance;
+      }
 
       if (selectedVoiceRef.current) {
         utterance.voice = selectedVoiceRef.current;
@@ -104,21 +144,57 @@ export function useSpeechSynthesis() {
       utterance.pitch = 0.95; // Slightly deeper, refined resonance
       utterance.rate = 1.05; // Articulate, measured pace
 
+      let hasCompleted = false;
+
+      const cleanupAndComplete = (invokeCallback: boolean) => {
+        if (hasCompleted) return;
+        hasCompleted = true;
+
+        if (fallbackTimerRef.current) {
+          clearTimeout(fallbackTimerRef.current);
+          fallbackTimerRef.current = null;
+        }
+
+        if (activeUtteranceRef.current === utterance) {
+          activeUtteranceRef.current = null;
+          if (typeof window !== 'undefined') {
+            (window as unknown as { __jarvis_active_utterance: SpeechSynthesisUtterance | null }).__jarvis_active_utterance = null;
+          }
+        }
+
+        setIsSpeaking(false);
+
+        if (invokeCallback) {
+          onEnd?.();
+        }
+      };
+
       utterance.onstart = () => {
         setIsSpeaking(true);
         onStart?.();
       };
 
       utterance.onend = () => {
-        setIsSpeaking(false);
-        onEnd?.();
+        cleanupAndComplete(true);
       };
 
       utterance.onerror = (err) => {
-        console.warn('[SpeechSynthesis] Utterance error:', err);
-        setIsSpeaking(false);
-        onEnd?.();
+        // If cancelled via stopSpeaking/cancel(), 'canceled' or 'interrupted' is raised
+        if (err.error === 'canceled' || err.error === 'interrupted') {
+          cleanupAndComplete(false);
+        } else {
+          console.warn('[SpeechSynthesis] Utterance error:', err);
+          cleanupAndComplete(true);
+        }
       };
+
+      // Fallback safety timeout in case Chromium drops onend event (prevents permanent speaking lock)
+      const wordCount = cleanText.split(/\s+/).filter(Boolean).length;
+      const estimatedDurationMs = Math.max(5000, (wordCount / 2) * 1000 + 4000);
+      fallbackTimerRef.current = setTimeout(() => {
+        console.warn('[SpeechSynthesis] Utterance safety fallback timer fired');
+        cleanupAndComplete(true);
+      }, estimatedDurationMs);
 
       window.speechSynthesis.speak(utterance);
     },

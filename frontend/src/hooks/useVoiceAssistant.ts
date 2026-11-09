@@ -74,8 +74,27 @@ export function useVoiceAssistant() {
   const voiceSocketRef = useRef<VoiceSocket | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
   const mediaStreamRef = useRef<MediaStream | null>(null);
+  const sourceNodeRef = useRef<MediaStreamAudioSourceNode | null>(null);
   const scriptProcessorRef = useRef<ScriptProcessorNode | null>(null);
+  const isCapturingRef = useRef<boolean>(false);
   const isStreamingPausedRef = useRef<boolean>(false);
+
+  // Keep ref to latest session ID without triggering effect re-execution
+  const activeSessionIdRef = useRef<string | null>(activeSessionId);
+  useEffect(() => {
+    activeSessionIdRef.current = activeSessionId;
+  }, [activeSessionId]);
+
+  // Keep refs for audio processor callback so it reads latest state without rebuilding node
+  const isVoiceModeActiveRef = useRef(isVoiceModeActive);
+  useEffect(() => {
+    isVoiceModeActiveRef.current = isVoiceModeActive;
+  }, [isVoiceModeActive]);
+
+  const isVoiceMutedRef = useRef(isVoiceMuted);
+  useEffect(() => {
+    isVoiceMutedRef.current = isVoiceMuted;
+  }, [isVoiceMuted]);
 
   const { speak, stopSpeaking, isSpeaking } = useSpeechSynthesis();
 
@@ -114,7 +133,7 @@ export function useVoiceAssistant() {
           setVoiceState('SPEAKING');
           const targetSessionId = event.session_id;
 
-          if (!activeSessionId) {
+          if (!activeSessionIdRef.current) {
             setActiveSessionId(targetSessionId);
           }
 
@@ -162,16 +181,26 @@ export function useVoiceAssistant() {
 
           queryClient.invalidateQueries({ queryKey: ['sessions'] });
 
-          // Speak reply with acoustic loopback prevention
+          // Speak reply with acoustic loopback prevention and single-dispatch guard
+          let ttsCompletedDispatched = false;
+          const sendTTSCompleted = () => {
+            if (ttsCompletedDispatched) return;
+            ttsCompletedDispatched = true;
+            isStreamingPausedRef.current = false;
+            if (voiceSocketRef.current?.isConnected()) {
+              voiceSocketRef.current.sendMessage({ type: 'tts_completed' });
+            }
+          };
+
           speak(
             event.reply,
             () => {
               isStreamingPausedRef.current = true;
             },
             () => {
+              // Acoustic echo suppression buffer delay
               setTimeout(() => {
-                isStreamingPausedRef.current = false;
-                voiceSocketRef.current?.sendMessage({ type: 'tts_completed' });
+                sendTTSCompleted();
               }, 300);
             }
           );
@@ -188,28 +217,47 @@ export function useVoiceAssistant() {
           break;
       }
     },
-    [activeSessionId, queryClient, setActiveSessionId, speak]
+    [queryClient, setActiveSessionId, speak]
   );
 
-  // Teardown microphone and audio pipeline
+  // Teardown microphone and audio pipeline cleanly
   const stopAudioCapture = useCallback(() => {
+    isCapturingRef.current = false;
+
     if (scriptProcessorRef.current) {
+      scriptProcessorRef.current.onaudioprocess = null;
       scriptProcessorRef.current.disconnect();
       scriptProcessorRef.current = null;
     }
+
+    if (sourceNodeRef.current) {
+      sourceNodeRef.current.disconnect();
+      sourceNodeRef.current = null;
+    }
+
     if (mediaStreamRef.current) {
       mediaStreamRef.current.getTracks().forEach((track) => track.stop());
       mediaStreamRef.current = null;
     }
-    if (audioContextRef.current && audioContextRef.current.state !== 'closed') {
-      audioContextRef.current.close().catch(() => {});
+
+    if (audioContextRef.current) {
+      if (audioContextRef.current.state !== 'closed') {
+        audioContextRef.current.close().catch(() => {});
+      }
       audioContextRef.current = null;
     }
+
     setAudioLevel(0);
   }, []);
 
-  // Setup microphone and streaming
+  // Setup microphone and streaming (guarded against multiple concurrent instances)
   const startAudioCapture = useCallback(async () => {
+    // Prevent multiple simultaneous audio capture pipelines
+    if (isCapturingRef.current || audioContextRef.current) {
+      return;
+    }
+    isCapturingRef.current = true;
+
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: {
@@ -219,6 +267,13 @@ export function useVoiceAssistant() {
           autoGainControl: true,
         },
       });
+
+      // If capture was stopped while getUserMedia was pending, discard stream immediately
+      if (!isCapturingRef.current) {
+        stream.getTracks().forEach((track) => track.stop());
+        return;
+      }
+
       mediaStreamRef.current = stream;
 
       const AudioContextClass =
@@ -228,13 +283,14 @@ export function useVoiceAssistant() {
       audioContextRef.current = audioCtx;
 
       const source = audioCtx.createMediaStreamSource(stream);
+      sourceNodeRef.current = source;
 
       // 4096 samples per buffer is a good balance between latency and JS overhead (~85ms @ 48kHz)
       const processor = audioCtx.createScriptProcessor(4096, 1, 1);
       scriptProcessorRef.current = processor;
 
       processor.onaudioprocess = (e) => {
-        if (!isVoiceModeActive || isVoiceMuted || isStreamingPausedRef.current) {
+        if (!isVoiceModeActiveRef.current || isVoiceMutedRef.current || isStreamingPausedRef.current) {
           setAudioLevel(0);
           return;
         }
@@ -257,12 +313,13 @@ export function useVoiceAssistant() {
       source.connect(processor);
       processor.connect(audioCtx.destination);
     } catch (err) {
+      isCapturingRef.current = false;
       console.error('[VoiceAssistant] Microphone access denied or failed:', err);
       setVoiceState('ERROR');
       setErrorMessage('Microphone access denied. Please grant microphone permission.');
       setVoiceModeActive(false);
     }
-  }, [isVoiceModeActive, isVoiceMuted, setVoiceModeActive]);
+  }, [setVoiceModeActive]);
 
   // Synchronize Voice mode on/off
   useEffect(() => {
@@ -275,10 +332,10 @@ export function useVoiceAssistant() {
       const removeEventListener = voiceSocketRef.current.addEventListener(handleServerEvent);
       voiceSocketRef.current.connect();
 
-      if (activeSessionId) {
+      if (activeSessionIdRef.current) {
         voiceSocketRef.current.sendMessage({
           type: 'set_session',
-          session_id: activeSessionId,
+          session_id: activeSessionIdRef.current,
         });
       }
 
@@ -286,6 +343,7 @@ export function useVoiceAssistant() {
 
       return () => {
         removeEventListener();
+        stopAudioCapture();
       };
     } else {
       stopSpeaking();
@@ -297,7 +355,7 @@ export function useVoiceAssistant() {
       setVoiceState('STANDBY');
       setStatusMessage('Voice Assistant offline');
     }
-  }, [isVoiceModeActive, activeSessionId, handleServerEvent, startAudioCapture, stopAudioCapture, stopSpeaking]);
+  }, [isVoiceModeActive, handleServerEvent, startAudioCapture, stopAudioCapture, stopSpeaking]);
 
   // Handle Mute toggle
   const toggleMute = useCallback(() => {
