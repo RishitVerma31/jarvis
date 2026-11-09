@@ -8,6 +8,12 @@ import { useQueryClient } from '@tanstack/react-query';
 import { VoiceSocket } from '../services/voiceSocket';
 import { playJarvisWakeChime } from '../utils/audioChime';
 import { setAudioSessionType } from '../utils/audioSession';
+import {
+  playBase64WavAudio,
+  stopAudioPlayback,
+  isAudioPlaying,
+  getPlaybackAudioContext,
+} from '../utils/audioPlayback';
 import { useSpeechSynthesis } from './useSpeechSynthesis';
 import { useUIStore } from '../stores/useUIStore';
 import type { MessageSchema, SessionDetailResponse } from '../types/api';
@@ -80,6 +86,8 @@ export function useVoiceAssistant() {
   const isCapturingRef = useRef<boolean>(false);
   const isStreamingPausedRef = useRef<boolean>(false);
   const echoBufferTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const activeAudioPlaybackStopRef = useRef<(() => void) | null>(null);
+  const currentTurnIdRef = useRef<number>(0);
 
   // Keep ref to latest session ID without triggering effect re-execution
   const activeSessionIdRef = useRef<string | null>(activeSessionId);
@@ -98,7 +106,71 @@ export function useVoiceAssistant() {
     isVoiceMutedRef.current = isVoiceMuted;
   }, [isVoiceMuted]);
 
-  const { speak, stopSpeaking, isSpeaking, unlockAudio, testSpeech, isAudioUnlocked } = useSpeechSynthesis();
+  const {
+    speak,
+    stopSpeaking: stopSpeechSynthesis,
+    isSpeaking: isBrowserSpeaking,
+    unlockAudio: baseUnlockAudio,
+    testSpeech,
+    isAudioUnlocked,
+  } = useSpeechSynthesis();
+
+  // Stop all active Kokoro audio playback and browser speech synthesis cleanly
+  const cancelAllSpeech = useCallback(() => {
+    currentTurnIdRef.current++;
+
+    if (echoBufferTimerRef.current) {
+      clearTimeout(echoBufferTimerRef.current);
+      echoBufferTimerRef.current = null;
+    }
+
+    if (activeAudioPlaybackStopRef.current) {
+      activeAudioPlaybackStopRef.current();
+      activeAudioPlaybackStopRef.current = null;
+    }
+    stopAudioPlayback();
+    stopSpeechSynthesis();
+
+    isStreamingPausedRef.current = false;
+    setAudioSessionType('play-and-record');
+    if (mediaStreamRef.current) {
+      mediaStreamRef.current.getAudioTracks().forEach((track) => {
+        track.enabled = true;
+      });
+    }
+  }, [stopSpeechSynthesis]);
+
+  const handleStopSpeaking = useCallback(() => {
+    cancelAllSpeech();
+    if (voiceSocketRef.current?.isConnected()) {
+      voiceSocketRef.current.sendMessage({ type: 'stop_speaking' });
+    }
+    setVoiceState('WAKE_LISTENING');
+    setStatusMessage('Standing by. Listening for "Hey Jarvis".');
+  }, [cancelAllSpeech]);
+
+  const emergencyStop = useCallback(() => {
+    cancelAllSpeech();
+    if (voiceSocketRef.current?.isConnected()) {
+      voiceSocketRef.current.sendMessage({ type: 'emergency_stop' });
+    }
+    setVoiceState('WAKE_LISTENING');
+    setStatusMessage('Emergency stop triggered. Standing by.');
+  }, [cancelAllSpeech]);
+
+  const handleUnlockAudio = useCallback(() => {
+    try {
+      getPlaybackAudioContext();
+    } catch {
+      // Best-effort priming
+    }
+    return baseUnlockAudio();
+  }, [baseUnlockAudio]);
+
+  const handleTestSpeech = useCallback(() => {
+    cancelAllSpeech();
+    return testSpeech();
+  }, [cancelAllSpeech, testSpeech]);
 
   // Keep active session synced to WebSocket
   useEffect(() => {
@@ -183,33 +255,9 @@ export function useVoiceAssistant() {
 
           queryClient.invalidateQueries({ queryKey: ['sessions'] });
 
-          // Clear any pending echo buffer timer from previous response
-          if (echoBufferTimerRef.current) {
-            clearTimeout(echoBufferTimerRef.current);
-            echoBufferTimerRef.current = null;
-          }
-
-          // Speak reply with acoustic loopback prevention and single-dispatch guard
-          let ttsCompletedDispatched = false;
-          const sendTTSCompleted = () => {
-            if (ttsCompletedDispatched) return;
-            ttsCompletedDispatched = true;
-            isStreamingPausedRef.current = false;
-
-            // Re-enable hardware microphone track after speech completes
-            if (mediaStreamRef.current) {
-              mediaStreamRef.current.getAudioTracks().forEach((track) => {
-                track.enabled = true;
-              });
-            }
-
-            // Restore iOS audio session to play-and-record for voice input
-            setAudioSessionType('play-and-record');
-
-            if (voiceSocketRef.current?.isConnected()) {
-              voiceSocketRef.current.sendMessage({ type: 'tts_completed' });
-            }
-          };
+          // Cancel any previous speech or audio playback and assign new turn ID
+          cancelAllSpeech();
+          const turnId = currentTurnIdRef.current;
 
           // Mute hardware microphone track before starting speech to release acoustic loopback
           if (mediaStreamRef.current) {
@@ -217,23 +265,108 @@ export function useVoiceAssistant() {
               track.enabled = false;
             });
           }
+          isStreamingPausedRef.current = true;
 
-          speak(
-            event.reply,
-            () => {
-              isStreamingPausedRef.current = true;
-            },
-            () => {
-              if (echoBufferTimerRef.current) {
-                clearTimeout(echoBufferTimerRef.current);
-              }
-              // Acoustic echo suppression buffer delay
-              echoBufferTimerRef.current = setTimeout(() => {
-                echoBufferTimerRef.current = null;
-                sendTTSCompleted();
-              }, 300);
+          // Speak reply with acoustic loopback prevention and single-dispatch guard
+          let ttsCompletedDispatched = false;
+          const sendTTSCompleted = () => {
+            if (currentTurnIdRef.current !== turnId) return;
+            if (ttsCompletedDispatched) return;
+            ttsCompletedDispatched = true;
+            activeAudioPlaybackStopRef.current = null;
+            isStreamingPausedRef.current = false;
+
+            // 1. Restore iOS audio session to play-and-record for voice input
+            setAudioSessionType('play-and-record');
+
+            // 2. Re-enable hardware microphone track after speech completes
+            if (mediaStreamRef.current) {
+              mediaStreamRef.current.getAudioTracks().forEach((track) => {
+                track.enabled = true;
+              });
             }
-          );
+
+            // 3. Signal tts_completed to backend
+            if (voiceSocketRef.current?.isConnected()) {
+              voiceSocketRef.current.sendMessage({ type: 'tts_completed' });
+            }
+          };
+
+          // 300ms acoustic echo suppression buffer delay
+          const scheduleTTSCompletion = () => {
+            if (currentTurnIdRef.current !== turnId) return;
+            if (echoBufferTimerRef.current) {
+              clearTimeout(echoBufferTimerRef.current);
+            }
+            echoBufferTimerRef.current = setTimeout(() => {
+              if (currentTurnIdRef.current !== turnId) return;
+              echoBufferTimerRef.current = null;
+              sendTTSCompleted();
+            }, 300);
+          };
+
+          // Fallback to browser SpeechSynthesis if Kokoro audio fails or is absent
+          const fallbackToSpeechSynthesis = (reason?: unknown) => {
+            if (currentTurnIdRef.current !== turnId) return;
+            console.warn('[VoiceAssistant] Kokoro playback failed, falling back to browser SpeechSynthesis:', reason);
+            activeAudioPlaybackStopRef.current = null;
+            try {
+              speak(
+                event.reply,
+                () => {
+                  if (currentTurnIdRef.current !== turnId) return;
+                  isStreamingPausedRef.current = true;
+                },
+                () => {
+                  scheduleTTSCompletion();
+                }
+              );
+            } catch (fallbackErr) {
+              console.error('[VoiceAssistant] Fallback speech synthesis failed:', fallbackErr);
+              cancelAllSpeech();
+            }
+          };
+
+          if (event.audio && typeof event.audio === 'string' && event.audio.trim().length > 0) {
+            try {
+              let playbackCancelled = false;
+              const cancelAudio = playBase64WavAudio(
+                event.audio,
+                () => {
+                  if (currentTurnIdRef.current !== turnId) return;
+                  isStreamingPausedRef.current = true;
+                },
+                () => {
+                  if (currentTurnIdRef.current !== turnId) return;
+                  activeAudioPlaybackStopRef.current = null;
+                  scheduleTTSCompletion();
+                },
+                (err) => {
+                  playbackCancelled = true;
+                  fallbackToSpeechSynthesis(err);
+                },
+                { autoRestoreSession: false }
+              );
+              if (!playbackCancelled) {
+                activeAudioPlaybackStopRef.current = cancelAudio;
+              } else {
+                activeAudioPlaybackStopRef.current = null;
+              }
+            } catch (err) {
+              fallbackToSpeechSynthesis(err);
+            }
+          } else {
+            speak(
+              event.reply,
+              () => {
+                if (currentTurnIdRef.current !== turnId) return;
+                isStreamingPausedRef.current = true;
+              },
+              () => {
+                scheduleTTSCompletion();
+              }
+            );
+          }
           break;
         }
 
@@ -244,10 +377,11 @@ export function useVoiceAssistant() {
         case 'error':
           setVoiceState('ERROR');
           setErrorMessage(event.message);
+          cancelAllSpeech();
           break;
       }
     },
-    [queryClient, setActiveSessionId, speak]
+    [cancelAllSpeech, queryClient, setActiveSessionId, speak]
   );
 
   // Teardown microphone and audio pipeline cleanly
@@ -361,6 +495,11 @@ export function useVoiceAssistant() {
       }
 
       const removeEventListener = voiceSocketRef.current.addEventListener(handleServerEvent);
+      const removeConnectionListener = voiceSocketRef.current.addConnectionListener((connected) => {
+        if (!connected) {
+          cancelAllSpeech();
+        }
+      });
       voiceSocketRef.current.connect();
 
       if (activeSessionIdRef.current) {
@@ -373,19 +512,13 @@ export function useVoiceAssistant() {
       startAudioCapture();
 
       return () => {
-        if (echoBufferTimerRef.current) {
-          clearTimeout(echoBufferTimerRef.current);
-          echoBufferTimerRef.current = null;
-        }
+        cancelAllSpeech();
         removeEventListener();
+        removeConnectionListener();
         stopAudioCapture();
       };
     } else {
-      if (echoBufferTimerRef.current) {
-        clearTimeout(echoBufferTimerRef.current);
-        echoBufferTimerRef.current = null;
-      }
-      stopSpeaking();
+      cancelAllSpeech();
       stopAudioCapture();
       setAudioSessionType('auto');
       if (voiceSocketRef.current) {
@@ -395,7 +528,7 @@ export function useVoiceAssistant() {
       setVoiceState('STANDBY');
       setStatusMessage('Voice Assistant offline');
     }
-  }, [isVoiceModeActive, handleServerEvent, startAudioCapture, stopAudioCapture, stopSpeaking]);
+  }, [isVoiceModeActive, cancelAllSpeech, handleServerEvent, startAudioCapture, stopAudioCapture]);
 
   // Handle Mute toggle
   const toggleMute = useCallback(() => {
@@ -408,42 +541,21 @@ export function useVoiceAssistant() {
     }
   }, [isVoiceMuted, setVoiceMuted]);
 
-  // Emergency stop
-  const emergencyStop = useCallback(() => {
-    if (echoBufferTimerRef.current) {
-      clearTimeout(echoBufferTimerRef.current);
-      echoBufferTimerRef.current = null;
-    }
-    stopSpeaking();
-    isStreamingPausedRef.current = false;
-    if (mediaStreamRef.current) {
-      mediaStreamRef.current.getAudioTracks().forEach((track) => {
-        track.enabled = true;
-      });
-    }
-    setAudioSessionType('play-and-record');
-    if (voiceSocketRef.current?.isConnected()) {
-      voiceSocketRef.current.sendMessage({ type: 'emergency_stop' });
-    }
-    setVoiceState('WAKE_LISTENING');
-    setStatusMessage('Emergency stop triggered. Standing by.');
-  }, [stopSpeaking]);
-
   return {
     voiceState,
     statusMessage,
     audioLevel,
     lastMetrics,
     errorMessage,
-    isSpeaking,
+    isSpeaking: isBrowserSpeaking || isAudioPlaying() || voiceState === 'SPEAKING',
     isVoiceModeActive,
     isVoiceMuted,
     isAudioUnlocked,
-    unlockAudio,
-    testSpeech,
+    unlockAudio: handleUnlockAudio,
+    testSpeech: handleTestSpeech,
     setVoiceModeActive,
     toggleMute,
     emergencyStop,
-    stopSpeaking,
+    stopSpeaking: handleStopSpeaking,
   };
 }
