@@ -2,11 +2,13 @@
 
 from contextlib import asynccontextmanager
 import logging
+from pathlib import Path
 from typing import AsyncGenerator
-from fastapi import FastAPI, Request, status
+from fastapi import APIRouter, FastAPI, Request, Response, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 import uvicorn
 
 from backend.config import get_settings
@@ -125,17 +127,52 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
     )
 
 
-# Include API Routers
-app.include_router(auth_router)
-app.include_router(health_router)
-app.include_router(chat_router)
-app.include_router(sessions_router)
+# 1. Mount production API routers under /api (matches production frontend calls)
+api_router = APIRouter(prefix="/api")
+api_router.include_router(auth_router)       # -> /api/auth/ws-ticket
+api_router.include_router(health_router)     # -> /api/health
+api_router.include_router(chat_router)       # -> /api/chat
+api_router.include_router(sessions_router)   # -> /api/sessions and /api/sessions/{session_id}
+app.include_router(api_router)
+
+# 2. Mount root-level HTTP routers for backward compatibility with legacy calls & test suites
+app.include_router(auth_router)              # -> /auth/ws-ticket
+app.include_router(health_router)            # -> /health
+app.include_router(chat_router)              # -> /chat
+app.include_router(sessions_router)          # -> /sessions and /sessions/{session_id}
+
+# 3. Mount Voice WebSocket router (already defines both /ws/voice and /api/ws/voice; do not double-prefix)
 app.include_router(voice_router)
 
 
-@app.get("/", tags=["Root"])
-async def root_status() -> dict[str, str | bool]:
-    """Root status endpoint verifying API availability."""
+# Canonical API Status Endpoints
+@app.get("/api", tags=["Root"])
+@app.get("/api/status", tags=["Root"])
+async def api_status() -> dict[str, str | bool]:
+    """Root API status endpoint verifying service availability."""
+    return {
+        "project": "PROJECT JARVIS",
+        "status": "online",
+        "version": "1.0.0",
+        "docs": docs_url or "disabled",
+        "health": "/api/health",
+    }
+
+
+# Static Frontend Distribution Delivery
+dist_path = Path(__file__).resolve().parent.parent / "frontend" / "dist"
+assets_path = dist_path / "assets"
+if assets_path.exists():
+    app.mount("/assets", StaticFiles(directory=str(assets_path)), name="assets")
+
+
+@app.get("/", tags=["Root"], response_model=None)
+async def root_handler(request: Request) -> Response | dict[str, str | bool]:
+    """Root endpoint: serves SPA index.html to web browsers; JSON status to API clients."""
+    accept = request.headers.get("accept", "")
+    dist_index = dist_path / "index.html"
+    if "text/html" in accept and dist_index.exists():
+        return FileResponse(dist_index)
     return {
         "project": "PROJECT JARVIS",
         "status": "online",
