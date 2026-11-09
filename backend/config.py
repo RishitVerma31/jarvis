@@ -79,11 +79,11 @@ class Settings(BaseSettings):
         description="faster-whisper model size (e.g. 'base.en', 'small.en')",
     )
     WHISPER_DEVICE: str = Field(
-        default="auto",
+        default="cpu",
         description="Compute device for faster-whisper ('cuda', 'cpu', or 'auto')",
     )
     WHISPER_COMPUTE_TYPE: str = Field(
-        default="auto",
+        default="int8",
         description="Precision for faster-whisper ('float16', 'int8', or 'auto')",
     )
 
