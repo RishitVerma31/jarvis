@@ -135,7 +135,7 @@ class OllamaService:
                 detail=f"Ollama returned HTTP {response.status_code}: {response.text}",
             )
 
-        except httpx.ConnectError as exc:
+        except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
             msg = (
                 f"Ollama service is unreachable at {self.base_url}. "
                 "Ensure Ollama is running locally on the Windows machine."
