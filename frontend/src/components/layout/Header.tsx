@@ -15,12 +15,12 @@ export const Header: React.FC = () => {
   const isBackendOnline = health?.backend === 'healthy';
 
   return (
-    <header className="h-14 border-b border-cyan-900/30 bg-slate-950/80 backdrop-blur-xl px-4 flex items-center justify-between z-10 shrink-0 select-none">
-      <div className="flex items-center gap-3">
+    <header className="min-h-14 pt-[env(safe-area-inset-top)] border-b border-cyan-900/30 bg-slate-950/80 backdrop-blur-xl px-2 sm:px-4 flex items-center justify-between z-10 shrink-0 select-none gap-1 sm:gap-2">
+      <div className="flex items-center gap-1.5 sm:gap-3">
         <button
           type="button"
           onClick={toggleSidebar}
-          className="p-1.5 rounded-lg text-slate-400 hover:text-cyan-300 hover:bg-cyan-950/40 hover:border-cyan-800/40 border border-transparent transition-all"
+          className="p-2 sm:p-1.5 min-w-[44px] min-h-[44px] flex items-center justify-center rounded-lg text-slate-400 hover:text-cyan-300 hover:bg-cyan-950/40 hover:border-cyan-800/40 border border-transparent transition-all cursor-pointer"
           title={isSidebarOpen ? 'Collapse sidebar' : 'Expand sidebar'}
           aria-label={isSidebarOpen ? 'Collapse sidebar' : 'Expand sidebar'}
         >
@@ -31,16 +31,16 @@ export const Header: React.FC = () => {
           )}
         </button>
 
-        <div className="flex items-center gap-2.5">
-          <div className="w-8 h-8 rounded-xl bg-gradient-to-tr from-cyan-600/30 to-sky-400/20 border border-cyan-400/40 flex items-center justify-center text-cyan-300 shadow-[0_0_15px_rgba(6,182,212,0.3)]">
-            <Bot className="w-4 h-4" />
+        <div className="flex items-center gap-2">
+          <div className="w-7 h-7 sm:w-8 sm:h-8 rounded-xl bg-gradient-to-tr from-cyan-600/30 to-sky-400/20 border border-cyan-400/40 flex items-center justify-center text-cyan-300 shadow-[0_0_15px_rgba(6,182,212,0.3)] shrink-0">
+            <Bot className="w-3.5 h-3.5 sm:w-4 sm:h-4" />
           </div>
           <div>
-            <div className="flex items-center gap-2">
-              <span className="font-bold text-sm tracking-wider text-slate-100 font-sans">
+            <div className="flex items-center gap-1.5">
+              <span className="font-bold text-xs sm:text-sm tracking-wider text-slate-100 font-sans">
                 J.A.R.V.I.S.
               </span>
-              <span className="text-[10px] uppercase tracking-widest px-1.5 py-0.5 rounded bg-cyan-950/70 text-cyan-300 font-mono border border-cyan-700/40 shadow-sm">
+              <span className="hidden sm:inline-block text-[10px] uppercase tracking-widest px-1.5 py-0.5 rounded bg-cyan-950/70 text-cyan-300 font-mono border border-cyan-700/40 shadow-sm">
                 MK VII
               </span>
             </div>
@@ -49,11 +49,11 @@ export const Header: React.FC = () => {
       </div>
 
       {/* Voice Assistant HUD & Controls */}
-      <div className="flex items-center justify-center">
+      <div className="flex items-center justify-center min-w-0">
         <VoiceControls />
       </div>
 
-      <div className="flex items-center gap-2 sm:gap-3">
+      <div className="flex items-center gap-1.5 sm:gap-3">
         {/* Real-time Telemetry: Backend & Database Indicators */}
         <div className="hidden lg:flex items-center gap-2 px-2.5 py-1 rounded-full border border-slate-800 bg-slate-900/40 text-[11px] font-mono text-slate-400">
           <span
@@ -96,7 +96,7 @@ export const Header: React.FC = () => {
         <button
           type="button"
           onClick={() => setAuthModalOpen(true)}
-          className={`flex items-center gap-1.5 px-2.5 py-1 rounded-full border text-xs font-mono transition-all cursor-pointer ${
+          className={`flex items-center gap-1 sm:gap-1.5 px-2 sm:px-2.5 py-1.5 min-h-[44px] sm:min-h-0 rounded-full border text-xs font-mono transition-all cursor-pointer ${
             isAuthenticated
               ? 'border-emerald-800/40 bg-emerald-950/20 text-emerald-300 hover:bg-emerald-900/30'
               : 'border-amber-800/50 bg-amber-950/30 text-amber-300 hover:bg-amber-900/40 animate-pulse'
@@ -105,12 +105,12 @@ export const Header: React.FC = () => {
         >
           {isAuthenticated ? (
             <>
-              <ShieldCheck className="w-3.5 h-3.5 text-emerald-400" />
+              <ShieldCheck className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
               <span className="hidden sm:inline text-[11px] font-semibold">SECURE</span>
             </>
           ) : (
             <>
-              <ShieldAlert className="w-3.5 h-3.5 text-amber-400" />
+              <ShieldAlert className="w-3.5 h-3.5 text-amber-400 shrink-0" />
               <span className="hidden sm:inline text-[11px] font-semibold">LOCKED</span>
             </>
           )}
@@ -128,7 +128,7 @@ export const Header: React.FC = () => {
           type="button"
           onClick={() => refetch()}
           disabled={isFetching}
-          className="p-1.5 rounded-lg text-slate-400 hover:text-cyan-300 hover:bg-cyan-950/40 disabled:opacity-50 transition-all border border-transparent hover:border-cyan-800/40"
+          className="p-2 sm:p-1.5 min-w-[44px] min-h-[44px] flex items-center justify-center rounded-lg text-slate-400 hover:text-cyan-300 hover:bg-cyan-950/40 disabled:opacity-50 transition-all border border-transparent hover:border-cyan-800/40 cursor-pointer"
           title="Refresh telemetry"
           aria-label="Refresh telemetry"
         >

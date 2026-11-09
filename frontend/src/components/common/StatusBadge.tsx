@@ -86,11 +86,11 @@ export const StatusBadge: React.FC<StatusBadgeProps> = ({
 
   return (
     <div
-      className={`inline-flex items-center gap-2 px-3 py-1 rounded-full border text-xs font-mono font-medium transition-all ${styles.bg}`}
+      className={`inline-flex items-center gap-1.5 sm:gap-2 px-2 sm:px-3 py-1 rounded-full border text-xs font-mono font-medium transition-all ${styles.bg}`}
       title={detail}
     >
-      <span className={`w-2 h-2 rounded-full shadow-sm animate-pulse ${styles.dot}`} />
-      <span className={styles.text}>{label}</span>
+      <span className={`w-2 h-2 rounded-full shadow-sm animate-pulse shrink-0 ${styles.dot}`} />
+      <span className={`hidden sm:inline ${styles.text}`}>{label}</span>
       {detail && (
         <span className="hidden xl:inline-block text-slate-400 font-mono text-[10px] truncate max-w-[220px]">
           [{detail}]

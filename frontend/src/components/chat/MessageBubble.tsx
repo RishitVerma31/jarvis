@@ -78,7 +78,7 @@ export const MessageBubble: React.FC<MessageBubbleProps> = ({ message }) => {
             <button
               type="button"
               onClick={handleCopy}
-              className="opacity-0 group-hover:opacity-100 focus:opacity-100 flex items-center gap-1 text-[11px] font-mono text-slate-400 hover:text-cyan-300 transition-all p-1 rounded hover:bg-slate-800/60 cursor-pointer"
+              className="opacity-100 sm:opacity-0 sm:group-hover:opacity-100 focus:opacity-100 flex items-center gap-1 text-[11px] font-mono text-slate-400 hover:text-cyan-300 transition-all p-1.5 min-h-[32px] rounded hover:bg-slate-800/60 cursor-pointer"
               title="Copy entire response to clipboard"
               aria-label="Copy response"
             >

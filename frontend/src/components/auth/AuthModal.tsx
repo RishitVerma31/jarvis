@@ -89,9 +89,9 @@ export const AuthModal: React.FC = () => {
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/80 backdrop-blur-md animate-fade-in">
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-4 bg-slate-950/80 backdrop-blur-md animate-fade-in pt-[env(safe-area-inset-top)] pb-[calc(1rem+env(safe-area-inset-bottom))]">
       <div
-        className="relative w-full max-w-md overflow-hidden rounded-2xl border border-cyan-500/40 bg-gradient-to-b from-slate-900 via-slate-950 to-slate-950 p-6 shadow-[0_0_50px_rgba(6,182,212,0.25)] text-slate-100"
+        className="relative w-full max-w-[94vw] sm:max-w-md max-h-[90vh] overflow-y-auto rounded-2xl border border-cyan-500/40 bg-gradient-to-b from-slate-900 via-slate-950 to-slate-950 p-4 sm:p-6 shadow-[0_0_50px_rgba(6,182,212,0.25)] text-slate-100"
         role="dialog"
         aria-modal="true"
         aria-labelledby="auth-modal-title"
@@ -104,7 +104,7 @@ export const AuthModal: React.FC = () => {
           <button
             type="button"
             onClick={handleClose}
-            className="absolute top-4 right-4 p-1.5 rounded-lg text-slate-400 hover:text-cyan-300 hover:bg-cyan-950/40 border border-transparent hover:border-cyan-800/40 transition-all"
+            className="absolute top-3 right-3 sm:top-4 sm:right-4 p-2 min-w-[44px] min-h-[44px] flex items-center justify-center rounded-lg text-slate-400 hover:text-cyan-300 hover:bg-cyan-950/40 border border-transparent hover:border-cyan-800/40 transition-all cursor-pointer"
             title="Close dialog"
             aria-label="Close dialog"
           >
@@ -190,13 +190,13 @@ export const AuthModal: React.FC = () => {
                 placeholder="Enter JARVIS_API_KEY..."
                 disabled={isValidating}
                 autoFocus
-                className="w-full pl-9 pr-10 py-2.5 rounded-xl bg-slate-900/90 border border-slate-700/80 text-sm text-slate-100 placeholder-slate-500 font-mono focus:outline-none focus:border-cyan-400 focus:ring-1 focus:ring-cyan-400 transition-all shadow-inner"
+                className="w-full pl-9 pr-11 py-2.5 rounded-xl bg-slate-900/90 border border-slate-700/80 text-[16px] sm:text-sm text-slate-100 placeholder-slate-500 font-mono focus:outline-none focus:border-cyan-400 focus:ring-1 focus:ring-cyan-400 transition-all shadow-inner"
               />
               <button
                 type="button"
                 onClick={() => setShowPassword(!showPassword)}
                 tabIndex={-1}
-                className="absolute inset-y-0 right-0 pr-3 flex items-center text-slate-400 hover:text-cyan-300 transition-colors"
+                className="absolute inset-y-0 right-0 pr-3 flex items-center min-w-[44px] min-h-[44px] justify-center text-slate-400 hover:text-cyan-300 transition-colors cursor-pointer"
                 title={showPassword ? 'Hide passkey' : 'Show passkey'}
                 aria-label={showPassword ? 'Hide passkey' : 'Show passkey'}
               >
@@ -212,7 +212,7 @@ export const AuthModal: React.FC = () => {
             <button
               type="submit"
               disabled={isValidating || !inputKey.trim()}
-              className="flex-1 flex items-center justify-center gap-2 py-2.5 px-4 rounded-xl bg-gradient-to-r from-cyan-600 to-sky-600 hover:from-cyan-500 hover:to-sky-500 text-white text-xs font-mono font-semibold uppercase tracking-wider transition-all shadow-[0_0_20px_rgba(6,182,212,0.3)] disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
+              className="flex-1 flex items-center justify-center gap-2 py-3 px-4 min-h-[44px] rounded-xl bg-gradient-to-r from-cyan-600 to-sky-600 hover:from-cyan-500 hover:to-sky-500 text-white text-xs font-mono font-semibold uppercase tracking-wider transition-all shadow-[0_0_20px_rgba(6,182,212,0.3)] disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
             >
               {isValidating ? (
                 <>
@@ -232,7 +232,7 @@ export const AuthModal: React.FC = () => {
                 type="button"
                 onClick={handleClearAuth}
                 disabled={isValidating}
-                className="px-3 py-2.5 rounded-xl border border-rose-800/50 bg-rose-950/30 hover:bg-rose-900/40 text-rose-300 text-xs font-mono transition-all cursor-pointer"
+                className="px-4 py-3 min-h-[44px] rounded-xl border border-rose-800/50 bg-rose-950/30 hover:bg-rose-900/40 text-rose-300 text-xs font-mono transition-all cursor-pointer"
                 title="Lock system and delete stored passkey"
               >
                 Lock

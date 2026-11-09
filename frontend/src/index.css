@@ -1,5 +1,12 @@
 @import "tailwindcss";
 
+@layer base {
+  html, body {
+    -webkit-tap-highlight-color: transparent;
+    touch-action: manipulation;
+  }
+}
+
 @layer utilities {
   .glass-panel {
     background-color: rgba(10, 16, 29, 0.75);

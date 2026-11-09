@@ -51,7 +51,7 @@ export const App: React.FC = () => {
   }, [setAuthenticated, setAuthModalOpen, queryClient]);
 
   return (
-    <div className="flex h-screen w-screen overflow-hidden bg-slate-950 font-sans text-slate-100">
+    <div className="flex h-screen h-dvh min-h-dvh w-full overflow-hidden bg-slate-950 font-sans text-slate-100">
       {/* Security Authorization Modal */}
       <AuthModal />
 

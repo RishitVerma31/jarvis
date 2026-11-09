@@ -7,6 +7,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { VoiceSocket } from '../services/voiceSocket';
 import { playJarvisWakeChime } from '../utils/audioChime';
+import { setAudioSessionType } from '../utils/audioSession';
 import { useSpeechSynthesis } from './useSpeechSynthesis';
 import { useUIStore } from '../stores/useUIStore';
 import type { MessageSchema, SessionDetailResponse } from '../types/api';
@@ -78,6 +79,7 @@ export function useVoiceAssistant() {
   const scriptProcessorRef = useRef<ScriptProcessorNode | null>(null);
   const isCapturingRef = useRef<boolean>(false);
   const isStreamingPausedRef = useRef<boolean>(false);
+  const echoBufferTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Keep ref to latest session ID without triggering effect re-execution
   const activeSessionIdRef = useRef<string | null>(activeSessionId);
@@ -96,7 +98,7 @@ export function useVoiceAssistant() {
     isVoiceMutedRef.current = isVoiceMuted;
   }, [isVoiceMuted]);
 
-  const { speak, stopSpeaking, isSpeaking } = useSpeechSynthesis();
+  const { speak, stopSpeaking, isSpeaking, unlockAudio, testSpeech, isAudioUnlocked } = useSpeechSynthesis();
 
   // Keep active session synced to WebSocket
   useEffect(() => {
@@ -181,16 +183,40 @@ export function useVoiceAssistant() {
 
           queryClient.invalidateQueries({ queryKey: ['sessions'] });
 
+          // Clear any pending echo buffer timer from previous response
+          if (echoBufferTimerRef.current) {
+            clearTimeout(echoBufferTimerRef.current);
+            echoBufferTimerRef.current = null;
+          }
+
           // Speak reply with acoustic loopback prevention and single-dispatch guard
           let ttsCompletedDispatched = false;
           const sendTTSCompleted = () => {
             if (ttsCompletedDispatched) return;
             ttsCompletedDispatched = true;
             isStreamingPausedRef.current = false;
+
+            // Re-enable hardware microphone track after speech completes
+            if (mediaStreamRef.current) {
+              mediaStreamRef.current.getAudioTracks().forEach((track) => {
+                track.enabled = true;
+              });
+            }
+
+            // Restore iOS audio session to play-and-record for voice input
+            setAudioSessionType('play-and-record');
+
             if (voiceSocketRef.current?.isConnected()) {
               voiceSocketRef.current.sendMessage({ type: 'tts_completed' });
             }
           };
+
+          // Mute hardware microphone track before starting speech to release acoustic loopback
+          if (mediaStreamRef.current) {
+            mediaStreamRef.current.getAudioTracks().forEach((track) => {
+              track.enabled = false;
+            });
+          }
 
           speak(
             event.reply,
@@ -198,8 +224,12 @@ export function useVoiceAssistant() {
               isStreamingPausedRef.current = true;
             },
             () => {
+              if (echoBufferTimerRef.current) {
+                clearTimeout(echoBufferTimerRef.current);
+              }
               // Acoustic echo suppression buffer delay
-              setTimeout(() => {
+              echoBufferTimerRef.current = setTimeout(() => {
+                echoBufferTimerRef.current = null;
                 sendTTSCompleted();
               }, 300);
             }
@@ -259,6 +289,7 @@ export function useVoiceAssistant() {
     isCapturingRef.current = true;
 
     try {
+      setAudioSessionType('play-and-record');
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: {
           channelCount: 1,
@@ -342,12 +373,21 @@ export function useVoiceAssistant() {
       startAudioCapture();
 
       return () => {
+        if (echoBufferTimerRef.current) {
+          clearTimeout(echoBufferTimerRef.current);
+          echoBufferTimerRef.current = null;
+        }
         removeEventListener();
         stopAudioCapture();
       };
     } else {
+      if (echoBufferTimerRef.current) {
+        clearTimeout(echoBufferTimerRef.current);
+        echoBufferTimerRef.current = null;
+      }
       stopSpeaking();
       stopAudioCapture();
+      setAudioSessionType('auto');
       if (voiceSocketRef.current) {
         voiceSocketRef.current.disconnect();
         voiceSocketRef.current = null;
@@ -370,8 +410,18 @@ export function useVoiceAssistant() {
 
   // Emergency stop
   const emergencyStop = useCallback(() => {
+    if (echoBufferTimerRef.current) {
+      clearTimeout(echoBufferTimerRef.current);
+      echoBufferTimerRef.current = null;
+    }
     stopSpeaking();
     isStreamingPausedRef.current = false;
+    if (mediaStreamRef.current) {
+      mediaStreamRef.current.getAudioTracks().forEach((track) => {
+        track.enabled = true;
+      });
+    }
+    setAudioSessionType('play-and-record');
     if (voiceSocketRef.current?.isConnected()) {
       voiceSocketRef.current.sendMessage({ type: 'emergency_stop' });
     }
@@ -388,6 +438,9 @@ export function useVoiceAssistant() {
     isSpeaking,
     isVoiceModeActive,
     isVoiceMuted,
+    isAudioUnlocked,
+    unlockAudio,
+    testSpeech,
     setVoiceModeActive,
     toggleMute,
     emergencyStop,

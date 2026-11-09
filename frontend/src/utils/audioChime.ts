@@ -19,6 +19,13 @@ function getAudioContext(): AudioContext | null {
   return sharedAudioCtx;
 }
 
+export function primeAudioContext(): void {
+  const ctx = getAudioContext();
+  if (ctx && ctx.state === 'suspended') {
+    ctx.resume().catch(() => {});
+  }
+}
+
 export function playJarvisWakeChime(): void {
   const ctx = getAudioContext();
   if (!ctx) return;

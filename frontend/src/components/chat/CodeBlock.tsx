@@ -129,7 +129,7 @@ export const CodeBlock: React.FC<CodeBlockProps> = ({ language = 'text', value }
         <button
           type="button"
           onClick={handleCopy}
-          className="flex items-center gap-1.5 px-2 py-1 rounded-md text-[11px] font-mono text-slate-400 hover:text-cyan-200 hover:bg-slate-800/80 transition-all cursor-pointer"
+          className="flex items-center gap-1.5 px-2.5 py-1 min-h-[32px] rounded-md text-[11px] font-mono text-slate-400 hover:text-cyan-200 hover:bg-slate-800/80 transition-all cursor-pointer"
           title="Copy code to clipboard"
           aria-label="Copy code"
         >
