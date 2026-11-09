@@ -4,18 +4,27 @@ Manages bidirectional real-time audio streaming, wake-word detection,
 voice activity detection, speech-to-text, and conversational response dispatch.
 """
 
+import base64
 import json
 import logging
 import time
+from typing import Any
 from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect
+from backend.config import get_settings
 from backend.database import get_session_factory
 from backend.security import verify_websocket_ticket
 from backend.services.chat_service import ChatService
+from backend.services.kokoro_service import get_kokoro_service
 from backend.services.ollama_service import get_ollama_service
 from backend.services.voice_service import get_voice_service
 
 logger = logging.getLogger("jarvis.routers.voice")
 router = APIRouter(tags=["Voice"])
+
+# Timing constants
+SILENCE_TIMEOUT_SECONDS = 1.2
+MAX_RECORDING_SECONDS = 15.0
+INITIAL_SPEECH_TIMEOUT_SECONDS = 4.0
 
 
 async def handle_voice_websocket(websocket: WebSocket) -> None:
@@ -34,11 +43,6 @@ async def handle_voice_websocket(websocket: WebSocket) -> None:
     speech_started = False
     record_start_time = 0.0
     last_speech_time = 0.0
-
-    # Timing constants
-    SILENCE_TIMEOUT_SECONDS = 1.2
-    MAX_RECORDING_SECONDS = 15.0
-    INITIAL_SPEECH_TIMEOUT_SECONDS = 4.0
 
     logger.info("Client connected to voice WebSocket.")
     await websocket.send_json({
@@ -249,9 +253,30 @@ async def handle_voice_websocket(websocket: WebSocket) -> None:
                             chat_res.reply[:50],
                         )
 
+                        # Kokoro TTS Synthesis (if enabled)
+                        audio_b64: str | None = None
+                        tts_latency: float | None = None
+                        settings = get_settings()
+
+                        if settings.ENABLE_KOKORO_TTS:
+                            try:
+                                kokoro_service = get_kokoro_service(settings)
+                                wav_bytes, tts_lat = await kokoro_service.synthesize(
+                                    chat_res.reply,
+                                    voice=settings.KOKORO_VOICE,
+                                    speed=settings.KOKORO_SPEED,
+                                )
+                                audio_b64 = base64.b64encode(wav_bytes).decode("ascii")
+                                tts_latency = tts_lat
+                            except Exception as exc:
+                                logger.warning(
+                                    "Kokoro TTS generation failed; proceeding with text-only reply: %s",
+                                    exc,
+                                )
+
                         # Transition to SPEAKING
                         current_state = "SPEAKING"
-                        await websocket.send_json({
+                        response_payload: dict[str, Any] = {
                             "type": "chat_response",
                             "reply": chat_res.reply,
                             "user_message": transcript,
@@ -262,7 +287,15 @@ async def handle_voice_websocket(websocket: WebSocket) -> None:
                                 "stt_latency_ms": stt_latency,
                                 "llm_latency_ms": llm_latency,
                             },
-                        })
+                        }
+                        if audio_b64:
+                            response_payload["audio"] = audio_b64
+                            response_payload["audio_mime"] = "audio/wav"
+                            response_payload["voice"] = settings.KOKORO_VOICE
+                            if tts_latency is not None:
+                                response_payload["metrics"]["tts_latency_ms"] = tts_latency
+
+                        await websocket.send_json(response_payload)
                         await websocket.send_json({
                             "type": "state_change",
                             "state": current_state,

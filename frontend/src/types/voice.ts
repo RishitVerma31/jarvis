@@ -16,6 +16,7 @@ export type VoiceState =
 export interface VoiceMetrics {
   stt_latency_ms?: number;
   llm_latency_ms?: number;
+  tts_latency_ms?: number;
 }
 
 export interface VoiceStateChangeEvent {
@@ -42,6 +43,9 @@ export interface VoiceChatResponseEvent {
   session_id: string;
   model?: string;
   created_at: string;
+  audio?: string;
+  audio_mime?: string;
+  voice?: string;
   metrics?: VoiceMetrics;
 }
 
