@@ -12,9 +12,11 @@ greenlet>=3.1.0
 pytest>=8.3.0
 pytest-asyncio>=0.24.0
 
-# Voice & Audio (Stage 2.6)
+# Voice & Audio (Stage 2.6 & Kokoro TTS)
 openwakeword>=0.6.0
 onnxruntime>=1.20.0
 faster-whisper>=1.0.0
 webrtcvad-wheels>=2.0.14
 numpy>=1.26.0
+kokoro-onnx==0.4.7
+soundfile>=0.13.0

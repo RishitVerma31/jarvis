@@ -114,6 +114,28 @@ class Settings(BaseSettings):
         description="Precision for faster-whisper ('float16', 'int8', or 'auto')",
     )
 
+    # Kokoro-82M Neural TTS Settings
+    ENABLE_KOKORO_TTS: bool = Field(
+        default=True,
+        description="Enable local Kokoro-82M neural TTS speech generation",
+    )
+    KOKORO_MODEL_PATH: str = Field(
+        default=r"D:\Jarvis\models\kokoro\kokoro-v1.0.onnx",
+        description="Path to Kokoro ONNX model file",
+    )
+    KOKORO_VOICES_PATH: str = Field(
+        default=r"D:\Jarvis\models\kokoro\voices-v1.0.bin",
+        description="Path to Kokoro voices bin file",
+    )
+    KOKORO_VOICE: str = Field(
+        default="af_bella",
+        description="Default Kokoro voice identifier (e.g. 'af_bella')",
+    )
+    KOKORO_SPEED: float = Field(
+        default=1.0,
+        description="Speech speed multiplier (1.0 = normal)",
+    )
+
     @property
     def project_root(self) -> Path:
         """Return the root directory of the project."""
@@ -178,6 +200,36 @@ class Settings(BaseSettings):
         return raw_path.resolve()
 
     @property
+    def resolved_kokoro_model_path(self) -> Path:
+        """Resolve Kokoro ONNX model path, falling back to local ./data on non-Windows or missing D: drive."""
+        raw_path = Path(self.KOKORO_MODEL_PATH)
+        if os.name != "nt":
+            if str(raw_path).startswith("D:") or str(raw_path).startswith("d:"):
+                return (self.resolved_models_path / "kokoro" / raw_path.name).resolve()
+            return raw_path.resolve()
+
+        drive = raw_path.drive
+        if drive and not os.path.exists(f"{drive}\\"):
+            return (self.resolved_models_path / "kokoro" / raw_path.name).resolve()
+
+        return raw_path.resolve()
+
+    @property
+    def resolved_kokoro_voices_path(self) -> Path:
+        """Resolve Kokoro voices path, falling back to local ./data on non-Windows or missing D: drive."""
+        raw_path = Path(self.KOKORO_VOICES_PATH)
+        if os.name != "nt":
+            if str(raw_path).startswith("D:") or str(raw_path).startswith("d:"):
+                return (self.resolved_models_path / "kokoro" / raw_path.name).resolve()
+            return raw_path.resolve()
+
+        drive = raw_path.drive
+        if drive and not os.path.exists(f"{drive}\\"):
+            return (self.resolved_models_path / "kokoro" / raw_path.name).resolve()
+
+        return raw_path.resolve()
+
+    @property
     def database_url(self) -> str:
         """Return async SQLite SQLAlchemy URL."""
         posix_path = self.resolved_db_path.as_posix()
@@ -192,6 +244,7 @@ class Settings(BaseSettings):
         self.resolved_db_path.parent.mkdir(parents=True, exist_ok=True)
         self.resolved_log_path.parent.mkdir(parents=True, exist_ok=True)
         self.resolved_models_path.mkdir(parents=True, exist_ok=True)
+        self.resolved_kokoro_model_path.parent.mkdir(parents=True, exist_ok=True)
 
 
 @lru_cache()
