@@ -56,6 +56,36 @@ class Settings(BaseSettings):
         default=r"D:\Jarvis\logs\jarvis.log",
         description="Path to application log file",
     )
+    JARVIS_MODELS_PATH: str = Field(
+        default=r"D:\Jarvis\models",
+        description="Path to voice and speech model files",
+    )
+
+    # Voice Assistant (Stage 2.6)
+    WAKE_WORD_MODEL: str = Field(
+        default="hey_jarvis_v0.1",
+        description="Identifier of openWakeWord wake model",
+    )
+    WAKE_WORD_THRESHOLD: float = Field(
+        default=0.6,
+        description="Confidence threshold for wake word activation",
+    )
+    WAKE_WORD_COOLDOWN_SECONDS: float = Field(
+        default=2.0,
+        description="Cooldown seconds after wake word triggers to avoid repeated activation",
+    )
+    WHISPER_MODEL_SIZE: str = Field(
+        default="base.en",
+        description="faster-whisper model size (e.g. 'base.en', 'small.en')",
+    )
+    WHISPER_DEVICE: str = Field(
+        default="auto",
+        description="Compute device for faster-whisper ('cuda', 'cpu', or 'auto')",
+    )
+    WHISPER_COMPUTE_TYPE: str = Field(
+        default="auto",
+        description="Precision for faster-whisper ('float16', 'int8', or 'auto')",
+    )
 
     @property
     def project_root(self) -> Path:
@@ -103,6 +133,24 @@ class Settings(BaseSettings):
         return raw_path.resolve()
 
     @property
+    def resolved_models_path(self) -> Path:
+        """Resolve models cache directory, falling back to local ./data on macOS/Linux or missing D: drive."""
+        raw_path = Path(self.JARVIS_MODELS_PATH)
+
+        if os.name != "nt":
+            if str(raw_path).startswith("D:") or str(raw_path).startswith("d:"):
+                fallback = self.project_root / "data" / "models"
+                return fallback.resolve()
+            return raw_path.resolve()
+
+        drive = raw_path.drive
+        if drive and not os.path.exists(f"{drive}\\"):
+            fallback = self.project_root / "data" / "models"
+            return fallback.resolve()
+
+        return raw_path.resolve()
+
+    @property
     def database_url(self) -> str:
         """Return async SQLite SQLAlchemy URL."""
         posix_path = self.resolved_db_path.as_posix()
@@ -113,9 +161,10 @@ class Settings(BaseSettings):
         return f"sqlite+aiosqlite:///{posix_path}"
 
     def ensure_directories(self) -> None:
-        """Ensure parent directories for database and log files exist."""
+        """Ensure parent directories for database, log, and model files exist."""
         self.resolved_db_path.parent.mkdir(parents=True, exist_ok=True)
         self.resolved_log_path.parent.mkdir(parents=True, exist_ok=True)
+        self.resolved_models_path.mkdir(parents=True, exist_ok=True)
 
 
 @lru_cache()

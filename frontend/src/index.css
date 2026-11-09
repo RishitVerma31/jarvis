@@ -1,0 +1,154 @@
+@import "tailwindcss";
+
+@layer utilities {
+  .glass-panel {
+    background-color: rgba(10, 16, 29, 0.75);
+    backdrop-filter: blur(16px);
+    border: 1px solid rgba(6, 182, 212, 0.18);
+  }
+
+  .glow-arc {
+    box-shadow: 0 0 25px -3px rgba(6, 182, 212, 0.35), inset 0 0 15px 1px rgba(6, 182, 212, 0.2);
+  }
+
+  .glow-cyan-sm {
+    box-shadow: 0 0 12px -2px rgba(6, 182, 212, 0.3);
+  }
+
+  .glow-cyan-hover:hover {
+    box-shadow: 0 0 18px rgba(6, 182, 212, 0.4);
+    border-color: rgba(6, 182, 212, 0.5);
+  }
+
+  .stark-border {
+    border: 1px solid rgba(6, 182, 212, 0.25);
+  }
+}
+
+/* Arc Reactor & Futuristic Animations */
+@keyframes arc-spin {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes arc-spin-reverse {
+  from {
+    transform: rotate(360deg);
+  }
+  to {
+    transform: rotate(0deg);
+  }
+}
+
+@keyframes pulse-glow {
+  0%, 100% {
+    opacity: 0.6;
+    transform: scale(1);
+    filter: drop-shadow(0 0 10px rgba(6, 182, 212, 0.4));
+  }
+  50% {
+    opacity: 1;
+    transform: scale(1.04);
+    filter: drop-shadow(0 0 22px rgba(6, 182, 212, 0.8));
+  }
+}
+
+.animate-arc-spin {
+  animation: arc-spin 20s linear infinite;
+}
+
+.animate-arc-spin-reverse {
+  animation: arc-spin-reverse 15s linear infinite;
+}
+
+.animate-pulse-glow {
+  animation: pulse-glow 3.5s ease-in-out infinite;
+}
+
+/* Prism.js Syntax Highlighting Theme (Stark J.A.R.V.I.S. Dark Palette) */
+code[class*="language-"],
+pre[class*="language-"] {
+  color: #e2e8f0;
+  text-shadow: none;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+
+.token.comment,
+.token.prolog,
+.token.doctype,
+.token.cdata {
+  color: #64748b;
+  font-style: italic;
+}
+
+.token.punctuation {
+  color: #94a3b8;
+}
+
+.token.property,
+.token.tag,
+.token.boolean,
+.token.number,
+.token.constant,
+.token.symbol,
+.token.deleted {
+  color: #f59e0b;
+}
+
+.token.selector,
+.token.attr-name,
+.token.string,
+.token.char,
+.token.builtin,
+.token.inserted {
+  color: #10b981;
+}
+
+.token.operator,
+.token.entity,
+.token.url,
+.language-css .token.string,
+.style .token.string {
+  color: #38bdf8;
+}
+
+.token.atrule,
+.token.attr-value,
+.token.keyword {
+  color: #06b6d4;
+  font-weight: 600;
+}
+
+.token.function,
+.token.class-name {
+  color: #38bdf8;
+}
+
+.token.regex,
+.token.important,
+.token.variable {
+  color: #ec4899;
+}
+
+/* Custom sleek scrollbars */
+::-webkit-scrollbar {
+  width: 5px;
+  height: 5px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(6, 182, 212, 0.25);
+  border-radius: 9999px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(6, 182, 212, 0.5);
+}

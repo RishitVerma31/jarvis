@@ -10,7 +10,7 @@ import uvicorn
 
 from backend.config import get_settings
 from backend.database import close_db, init_db
-from backend.routers import chat_router, health_router, sessions_router
+from backend.routers import chat_router, health_router, sessions_router, voice_router
 from backend.utils.logger import setup_logger
 
 # Initialize application logger
@@ -29,6 +29,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     logger.info("Application Log Path: %s", settings.resolved_log_path)
     logger.info("Ollama Base URL: %s (Model: %s)", settings.OLLAMA_BASE_URL, settings.OLLAMA_MODEL)
     logger.info("Context Window Limit: %d messages", settings.MAX_HISTORY_MESSAGES)
+    logger.info("Models Storage Path: %s", settings.resolved_models_path)
+    logger.info("Wake Word: %s (Threshold: %.2f)", settings.WAKE_WORD_MODEL, settings.WAKE_WORD_THRESHOLD)
+    logger.info("Whisper STT: %s (Device: %s)", settings.WHISPER_MODEL_SIZE, settings.WHISPER_DEVICE)
     logger.info("==================================================")
 
     # 1. Initialize SQLite schema and ensure storage directories
@@ -80,6 +83,7 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
 app.include_router(health_router)
 app.include_router(chat_router)
 app.include_router(sessions_router)
+app.include_router(voice_router)
 
 
 @app.get("/", tags=["Root"])

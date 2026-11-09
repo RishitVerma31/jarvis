@@ -46,6 +46,10 @@ venv.bak/
 data/
 logs/
 database/
+models/
+*.onnx
+*.tflite
+*.bin
 *.log
 
 # Operating System files
@@ -64,3 +68,10 @@ desktop.ini
 .pytest_cache/
 .coverage
 htmlcov/
+
+# Node & Frontend
+node_modules/
+frontend/dist/
+frontend/.env.local
+frontend/.env.*.local
+!frontend/.env.example
