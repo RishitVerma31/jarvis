@@ -1,6 +1,15 @@
 """Pytest test fixtures and configuration for PROJECT JARVIS."""
 
 import os
+
+# Test credentials and environment variables must be configured before backend modules import settings
+TEST_DB_URL = "sqlite+aiosqlite:///:memory:"
+TEST_API_KEY = "jarvis-test-suite-secure-key-32-chars-minimum-token-12345"
+
+os.environ["ENVIRONMENT"] = "test"
+os.environ["JARVIS_API_KEY"] = TEST_API_KEY
+os.environ["CORS_ORIGINS"] = "http://localhost:5173,http://127.0.0.1:5173"
+
 from collections.abc import AsyncGenerator
 import pytest
 import pytest_asyncio
@@ -19,8 +28,7 @@ from backend.models.db_models import Base
 from backend.models.schemas import OllamaHealth
 from backend.services.ollama_service import OllamaService, get_ollama_service
 
-# Use in-memory SQLite for fast, isolated tests
-TEST_DB_URL = "sqlite+aiosqlite:///:memory:"
+get_settings.cache_clear()
 
 
 class MockOllamaService(OllamaService):
@@ -112,6 +120,29 @@ async def async_client(
     mock_ollama: MockOllamaService,
 ) -> AsyncGenerator[AsyncClient, None]:
     """Provide an async test client configured with the test DB and mock Ollama."""
+    async def override_get_db() -> AsyncGenerator[AsyncSession, None]:
+        yield test_session
+
+    def override_get_ollama() -> OllamaService:
+        return mock_ollama
+
+    app.dependency_overrides[get_db] = override_get_db
+    app.dependency_overrides[get_ollama_service] = override_get_ollama
+
+    transport = ASGITransport(app=app)
+    headers = {"Authorization": f"Bearer {TEST_API_KEY}"}
+    async with AsyncClient(transport=transport, base_url="http://testserver", headers=headers) as client:
+        yield client
+
+    app.dependency_overrides.clear()
+
+
+@pytest_asyncio.fixture
+async def unauthenticated_async_client(
+    test_session: AsyncSession,
+    mock_ollama: MockOllamaService,
+) -> AsyncGenerator[AsyncClient, None]:
+    """Provide an async test client without authentication headers."""
     async def override_get_db() -> AsyncGenerator[AsyncSession, None]:
         yield test_session
 

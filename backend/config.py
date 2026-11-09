@@ -7,7 +7,7 @@ path resolution between Windows 11 production and macOS development.
 from functools import lru_cache
 import os
 from pathlib import Path
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -15,7 +15,7 @@ class Settings(BaseSettings):
     """Configuration settings loaded from environment or .env file."""
 
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=(".env", r"D:\Jarvis\.env", "../.env"),
         env_file_encoding="utf-8",
         extra="ignore",
     )
@@ -25,6 +25,33 @@ class Settings(BaseSettings):
     HOST: str = Field(default="0.0.0.0", description="Host interface to bind to")
     PORT: int = Field(default=8000, description="Port to listen on")
     ENVIRONMENT: str = Field(default="production", description="Environment name")
+
+    # API Security & Authentication
+    JARVIS_API_KEY: str | None = Field(
+        default=None,
+        description="Cryptographic secret API key for authenticating HTTP clients",
+    )
+    CORS_ORIGINS: str = Field(
+        default="http://localhost:5173,http://127.0.0.1:5173",
+        description="Comma-separated or JSON list of explicit allowed CORS origins",
+    )
+    ENABLE_DOCS: bool = Field(
+        default=False,
+        description="Explicit toggle for interactive OpenAPI documentation outside development",
+    )
+    WS_TICKET_TTL_SECONDS: int = Field(
+        default=30,
+        description="Lifetime in seconds for short-lived, single-use WebSocket tickets",
+    )
+
+    @property
+    def cors_origins_list(self) -> list[str]:
+        """Return CORS_ORIGINS as a parsed list of origin strings."""
+        val = self.CORS_ORIGINS.strip()
+        if val.startswith("[") and val.endswith("]"):
+            import json
+            return json.loads(val)
+        return [orig.strip() for orig in val.split(",") if orig.strip()]
 
     # Ollama settings (Strictly localhost 127.0.0.1, never exposed externally)
     OLLAMA_BASE_URL: str = Field(

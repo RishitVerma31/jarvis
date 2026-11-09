@@ -1,12 +1,12 @@
 import React from 'react';
-import { PanelLeftClose, PanelLeft, Bot, Cpu, RotateCw, Database, Server } from 'lucide-react';
+import { PanelLeftClose, PanelLeft, Bot, Cpu, RotateCw, Database, Server, ShieldCheck, ShieldAlert } from 'lucide-react';
 import { useUIStore } from '../../stores/useUIStore';
 import { StatusBadge } from '../common/StatusBadge';
 import { useHealth } from '../../hooks/useHealth';
 import { VoiceControls } from '../voice/VoiceControls';
 
 export const Header: React.FC = () => {
-  const { isSidebarOpen, toggleSidebar } = useUIStore();
+  const { isSidebarOpen, toggleSidebar, isAuthenticated, setAuthModalOpen } = useUIStore();
   const { data: health, isLoading, isError, refetch, isFetching } = useHealth();
 
   const activeModel = health?.ollama?.target_model || 'qwen2.5:3b';
@@ -91,6 +91,30 @@ export const Header: React.FC = () => {
             title={isOllamaConnected ? 'Ollama Online' : 'Ollama Offline / Degraded'}
           />
         </div>
+
+        {/* Security / Clearance Passkey Badge */}
+        <button
+          type="button"
+          onClick={() => setAuthModalOpen(true)}
+          className={`flex items-center gap-1.5 px-2.5 py-1 rounded-full border text-xs font-mono transition-all cursor-pointer ${
+            isAuthenticated
+              ? 'border-emerald-800/40 bg-emerald-950/20 text-emerald-300 hover:bg-emerald-900/30'
+              : 'border-amber-800/50 bg-amber-950/30 text-amber-300 hover:bg-amber-900/40 animate-pulse'
+          }`}
+          title={isAuthenticated ? 'Security: Clearance Verified (Click to manage)' : 'Security: Authorization Required (Click to enter passkey)'}
+        >
+          {isAuthenticated ? (
+            <>
+              <ShieldCheck className="w-3.5 h-3.5 text-emerald-400" />
+              <span className="hidden sm:inline text-[11px] font-semibold">SECURE</span>
+            </>
+          ) : (
+            <>
+              <ShieldAlert className="w-3.5 h-3.5 text-amber-400" />
+              <span className="hidden sm:inline text-[11px] font-semibold">LOCKED</span>
+            </>
+          )}
+        </button>
 
         {/* Visual State: Green (Healthy) / Amber (Degraded) / Red (Unreachable) */}
         <StatusBadge

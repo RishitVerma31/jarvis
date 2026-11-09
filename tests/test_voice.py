@@ -1,10 +1,17 @@
 """Unit and integration tests for VoiceService and Voice WebSocket router."""
 
+import asyncio
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 from fastapi.testclient import TestClient
 from backend.main import app
+from backend.security import get_ticket_store
 from backend.services.voice_service import VoiceService
+
+
+def get_test_ws_ticket() -> str:
+    """Helper to generate a valid ticket for WebSocket testing."""
+    return asyncio.run(get_ticket_store().create_ticket())
 
 
 def test_voice_service_vad_silence():
@@ -83,7 +90,7 @@ async def test_voice_service_transcribe_pcm():
 def test_voice_websocket_connect_and_state():
     """Verify WebSocket connection handshake and initial WAKE_LISTENING state."""
     client = TestClient(app)
-    with client.websocket_connect("/ws/voice") as websocket:
+    with client.websocket_connect(f"/ws/voice?ticket={get_test_ws_ticket()}") as websocket:
         data = websocket.receive_json()
         assert data["type"] == "state_change"
         assert data["state"] == "WAKE_LISTENING"
@@ -92,7 +99,7 @@ def test_voice_websocket_connect_and_state():
 def test_voice_websocket_mute_unmute_and_ping():
     """Verify WebSocket mute, unmute, and ping/pong control frames."""
     client = TestClient(app)
-    with client.websocket_connect("/ws/voice") as websocket:
+    with client.websocket_connect(f"/ws/voice?ticket={get_test_ws_ticket()}") as websocket:
         # Handshake
         initial = websocket.receive_json()
         assert initial["state"] == "WAKE_LISTENING"
@@ -118,7 +125,7 @@ def test_voice_websocket_mute_unmute_and_ping():
 def test_voice_websocket_emergency_stop():
     """Verify emergency stop resets state to WAKE_LISTENING."""
     client = TestClient(app)
-    with client.websocket_connect("/ws/voice") as websocket:
+    with client.websocket_connect(f"/ws/voice?ticket={get_test_ws_ticket()}") as websocket:
         # Handshake
         websocket.receive_json()
 
@@ -132,7 +139,7 @@ def test_voice_websocket_emergency_stop():
 def test_voice_websocket_session_and_tts_completed():
     """Verify setting session and handling tts_completed resume."""
     client = TestClient(app)
-    with client.websocket_connect("/ws/voice") as websocket:
+    with client.websocket_connect(f"/ws/voice?ticket={get_test_ws_ticket()}") as websocket:
         # Handshake
         websocket.receive_json()
 

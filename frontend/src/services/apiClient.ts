@@ -5,6 +5,7 @@ import type {
   SessionDetailResponse,
   SessionSummary,
 } from '../types/api';
+import { getAuthToken, UNAUTHORIZED_EVENT } from './auth';
 
 /**
  * Standard application API error.
@@ -24,13 +25,23 @@ export class ApiError extends Error {
 /**
  * Generic JSON request wrapper using the Vite /api reverse proxy.
  */
-async function request<T>(endpoint: string, options: RequestInit = {}): Promise<T> {
+async function request<T>(
+  endpoint: string,
+  options: RequestInit = {},
+  tokenOverride?: string | null
+): Promise<T> {
   // Always prefix with /api so Vite proxy intercepts and forwards to backend
   const url = endpoint.startsWith('/') ? `/api${endpoint}` : `/api/${endpoint}`;
 
-  const defaultHeaders: HeadersInit = {
-    'Accept': 'application/json',
+  const token = tokenOverride !== undefined ? tokenOverride : getAuthToken();
+
+  const defaultHeaders: Record<string, string> = {
+    Accept: 'application/json',
   };
+
+  if (token) {
+    defaultHeaders['Authorization'] = `Bearer ${token}`;
+  }
 
   if (options.body && typeof options.body === 'string') {
     defaultHeaders['Content-Type'] = 'application/json';
@@ -63,6 +74,12 @@ async function request<T>(endpoint: string, options: RequestInit = {}): Promise<
     }
 
     if (!response.ok) {
+      if (response.status === 401) {
+        if (typeof window !== 'undefined') {
+          window.dispatchEvent(new CustomEvent(UNAUTHORIZED_EVENT));
+        }
+      }
+
       const errorMsg =
         typeof data === 'object' && data !== null && 'detail' in data
           ? String((data as { detail: unknown }).detail)
@@ -93,8 +110,18 @@ export const apiClient = {
    * Check system health (FastAPI, SQLite, Ollama).
    * GET /health
    */
-  async getHealth(): Promise<HealthResponse> {
-    return request<HealthResponse>('/health', { method: 'GET' });
+  async getHealth(tokenOverride?: string | null): Promise<HealthResponse> {
+    return request<HealthResponse>('/health', { method: 'GET' }, tokenOverride);
+  },
+
+  /**
+   * Request a short-lived, single-use ticket for authenticating a WebSocket audio connection.
+   * POST /auth/ws-ticket
+   */
+  async getWsTicket(): Promise<{ ticket: string; expires_in: number }> {
+    return request<{ ticket: string; expires_in: number }>('/auth/ws-ticket', {
+      method: 'POST',
+    });
   },
 
   /**

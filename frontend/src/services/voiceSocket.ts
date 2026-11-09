@@ -1,17 +1,22 @@
 /**
  * Centralized WebSocket client for Jarvis Voice Assistant.
  * Manages streaming PCM audio and bidirectional JSON control events.
+ * Authenticates via short-lived, single-use tickets issued by the backend.
+ * Never passes or logs the permanent API passkey in WebSocket URLs.
  */
 
 import type { VoiceClientMessage, VoiceServerEvent } from '../types/voice';
+import { apiClient } from './apiClient';
+import { isAuthenticated, UNAUTHORIZED_EVENT } from './auth';
 
 export type VoiceEventHandler = (event: VoiceServerEvent) => void;
 export type VoiceConnectionHandler = (isConnected: boolean) => void;
 
 export class VoiceSocket {
   private ws: WebSocket | null = null;
-  private url: string;
+  private baseUrl: string;
   private isExplicitlyClosed = false;
+  private isConnecting = false;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private reconnectAttempts = 0;
   private maxReconnectAttempts = 5;
@@ -20,25 +25,59 @@ export class VoiceSocket {
 
   constructor(customUrl?: string) {
     if (customUrl) {
-      this.url = customUrl;
+      this.baseUrl = customUrl;
     } else {
       const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-      this.url = `${protocol}//${window.location.host}/api/ws/voice`;
+      this.baseUrl = `${protocol}//${window.location.host}/api/ws/voice`;
     }
   }
 
-  public connect(): void {
-    if (this.ws && (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING)) {
+  public async connect(): Promise<void> {
+    if (
+      this.isConnecting ||
+      (this.ws &&
+        (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING))
+    ) {
       return;
     }
 
     this.isExplicitlyClosed = false;
+    this.isConnecting = true;
 
     try {
-      this.ws = new WebSocket(this.url);
+      // 1. Request an ephemeral, single-use ticket via authenticated HTTP endpoint
+      let ticket: string | null = null;
+      try {
+        const ticketRes = await apiClient.getWsTicket();
+        ticket = ticketRes.ticket;
+      } catch (authErr) {
+        this.isConnecting = false;
+        console.warn('[VoiceSocket] Failed to obtain WebSocket ticket (unauthorized or server unreachable)');
+        this.notifyConnectionState(false);
+        this.notifyEvent({
+          type: 'error',
+          message: 'Voice authorization required. Please verify your Jarvis passkey.',
+        });
+        return;
+      }
+
+      if (!ticket) {
+        this.isConnecting = false;
+        this.notifyConnectionState(false);
+        return;
+      }
+
+      // 2. Establish connection using the single-use ticket.
+      // NEVER append the permanent passkey to a WebSocket URL!
+      const separator = this.baseUrl.includes('?') ? '&' : '?';
+      const wsUrl = `${this.baseUrl}${separator}ticket=${encodeURIComponent(ticket)}`;
+
+      const socket = new WebSocket(wsUrl);
+      this.ws = socket;
       this.ws.binaryType = 'arraybuffer';
 
       this.ws.onopen = () => {
+        this.isConnecting = false;
         this.reconnectAttempts = 0;
         this.notifyConnectionState(true);
       };
@@ -54,26 +93,47 @@ export class VoiceSocket {
         }
       };
 
-      this.ws.onclose = () => {
+      this.ws.onclose = (event: CloseEvent) => {
+        this.isConnecting = false;
         this.notifyConnectionState(false);
         this.ws = null;
-        if (!this.isExplicitlyClosed) {
+
+        // Policy violation 1008 indicates ticket rejected or expired.
+        // Halt reconnection to prevent infinite retry loops.
+        if (event.code === 1008) {
+          console.warn('[VoiceSocket] Connection rejected with 1008 Policy Violation (Unauthorized)');
+          this.notifyEvent({
+            type: 'error',
+            message: 'Voice connection rejected by security policy. Passkey required.',
+          });
+          if (typeof window !== 'undefined') {
+            window.dispatchEvent(new CustomEvent(UNAUTHORIZED_EVENT));
+          }
+          return;
+        }
+
+        if (!this.isExplicitlyClosed && isAuthenticated()) {
           this.scheduleReconnect();
         }
       };
 
       this.ws.onerror = (err) => {
-        console.error('[VoiceSocket] WebSocket error:', err);
+        this.isConnecting = false;
+        console.error('[VoiceSocket] WebSocket error occurred:', err);
       };
     } catch (err) {
-      console.error('[VoiceSocket] Connection error:', err);
+      this.isConnecting = false;
+      console.error('[VoiceSocket] Connection setup error:', err);
       this.notifyConnectionState(false);
-      this.scheduleReconnect();
+      if (!this.isExplicitlyClosed && isAuthenticated()) {
+        this.scheduleReconnect();
+      }
     }
   }
 
   public disconnect(): void {
     this.isExplicitlyClosed = true;
+    this.isConnecting = false;
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
@@ -112,6 +172,10 @@ export class VoiceSocket {
   }
 
   private scheduleReconnect(): void {
+    if (!isAuthenticated()) {
+      return;
+    }
+
     if (this.reconnectAttempts >= this.maxReconnectAttempts) {
       console.warn('[VoiceSocket] Max reconnection attempts reached.');
       return;

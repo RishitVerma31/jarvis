@@ -5,11 +5,12 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from backend.database import get_db
 from backend.models.schemas import SessionDetailResponse, SessionSummary
+from backend.security import verify_api_key
 from backend.services.chat_service import ChatService
 from backend.services.ollama_service import OllamaService, get_ollama_service
 
 logger = logging.getLogger("jarvis.routers.sessions")
-router = APIRouter(prefix="/sessions", tags=["Sessions"])
+router = APIRouter(prefix="/sessions", tags=["Sessions"], dependencies=[Depends(verify_api_key)])
 
 
 @router.get(

@@ -4,9 +4,10 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, Depends
 from backend.database import check_db_health
 from backend.models.schemas import HealthResponse
+from backend.security import verify_api_key
 from backend.services.ollama_service import OllamaService, get_ollama_service
 
-router = APIRouter(tags=["Health"])
+router = APIRouter(tags=["Health"], dependencies=[Depends(verify_api_key)])
 
 
 @router.get(

@@ -7,8 +7,9 @@ voice activity detection, speech-to-text, and conversational response dispatch.
 import json
 import logging
 import time
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect
 from backend.database import get_session_factory
+from backend.security import verify_websocket_ticket
 from backend.services.chat_service import ChatService
 from backend.services.ollama_service import get_ollama_service
 from backend.services.voice_service import get_voice_service
@@ -291,13 +292,23 @@ async def handle_voice_websocket(websocket: WebSocket) -> None:
 
 
 @router.websocket("/ws/voice")
-async def voice_websocket_endpoint(websocket: WebSocket) -> None:
+async def voice_websocket_endpoint(
+    websocket: WebSocket,
+    ticket: str | None = Query(default=None),
+) -> None:
     """Primary WebSocket endpoint for voice assistant audio and events."""
+    if not await verify_websocket_ticket(websocket, ticket):
+        return
     await handle_voice_websocket(websocket)
 
 
 @router.websocket("/api/ws/voice")
-async def voice_websocket_alias(websocket: WebSocket) -> None:
+async def voice_websocket_alias(
+    websocket: WebSocket,
+    ticket: str | None = Query(default=None),
+) -> None:
     """Alias WebSocket endpoint matching /api prefix."""
+    if not await verify_websocket_ticket(websocket, ticket):
+        return
     await handle_voice_websocket(websocket)
 

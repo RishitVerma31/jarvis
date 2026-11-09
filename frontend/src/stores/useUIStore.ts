@@ -26,6 +26,12 @@ interface UIState {
   isVoiceMuted: boolean;
   setVoiceMuted: (muted: boolean) => void;
   toggleVoiceMuted: () => void;
+
+  // Security & Passkey Authentication (Stage B)
+  isAuthModalOpen: boolean;
+  setAuthModalOpen: (open: boolean) => void;
+  isAuthenticated: boolean;
+  setAuthenticated: (authenticated: boolean) => void;
 }
 
 export const useUIStore = create<UIState>((set) => ({
@@ -49,4 +55,9 @@ export const useUIStore = create<UIState>((set) => ({
   isVoiceMuted: false,
   setVoiceMuted: (muted) => set({ isVoiceMuted: muted }),
   toggleVoiceMuted: () => set((state) => ({ isVoiceMuted: !state.isVoiceMuted })),
+
+  isAuthModalOpen: false,
+  setAuthModalOpen: (open) => set({ isAuthModalOpen: open }),
+  isAuthenticated: false,
+  setAuthenticated: (authenticated) => set({ isAuthenticated: authenticated }),
 }));

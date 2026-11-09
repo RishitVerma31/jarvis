@@ -5,11 +5,12 @@ from fastapi import APIRouter, Depends, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from backend.database import get_db
 from backend.models.schemas import ChatRequest, ChatResponse
+from backend.security import verify_api_key
 from backend.services.chat_service import ChatService
 from backend.services.ollama_service import OllamaService, get_ollama_service
 
 logger = logging.getLogger("jarvis.routers.chat")
-router = APIRouter(tags=["Chat"])
+router = APIRouter(tags=["Chat"], dependencies=[Depends(verify_api_key)])
 
 
 @router.post(
