@@ -325,3 +325,4 @@ To ensure the AI model never slows down or runs out of VRAM while preserving eve
   - Verify the Windows network is set to **Private**.
   - Re-run the PowerShell firewall command from Step 3.4.
   - Verify Windows IP with `ipconfig`.
+

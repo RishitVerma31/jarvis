@@ -164,3 +164,4 @@ def get_ollama_service() -> OllamaService:
     if _ollama_service is None:
         _ollama_service = OllamaService()
     return _ollama_service
+

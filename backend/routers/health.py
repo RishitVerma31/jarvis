@@ -37,3 +37,4 @@ async def health_check(
         ollama=ollama_health,
         timestamp=datetime.now(timezone.utc),
     )
+

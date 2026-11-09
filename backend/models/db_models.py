@@ -92,3 +92,4 @@ class MessageModel(Base):
 
     def __repr__(self) -> str:
         return f"<MessageModel id={self.id} session_id='{self.session_id}' role='{self.role}'>"
+

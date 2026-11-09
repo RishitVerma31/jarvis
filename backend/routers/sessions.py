@@ -47,3 +47,4 @@ async def get_session(
             detail=f"Session '{session_id}' not found.",
         )
     return detail
+

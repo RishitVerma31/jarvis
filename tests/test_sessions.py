@@ -60,3 +60,4 @@ async def test_list_sessions_and_detail(async_client: AsyncClient) -> None:
     # 3. Test GET /sessions/{non_existent} returns 404
     missing_resp = await async_client.get("/sessions/non-existent-id")
     assert missing_resp.status_code == 404
+

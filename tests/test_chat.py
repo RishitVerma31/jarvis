@@ -139,3 +139,4 @@ async def test_chat_ollama_timeout_returns_504(
     assert response.status_code == 504
     data = response.json()
     assert "timed out" in data["detail"]
+

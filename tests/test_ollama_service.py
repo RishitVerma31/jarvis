@@ -31,3 +31,4 @@ async def test_ollama_service_generate_unreachable_raises_503() -> None:
 
     assert exc_info.value.status_code == 503
     assert "unreachable" in exc_info.value.detail.lower()
+

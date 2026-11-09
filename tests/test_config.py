@@ -28,3 +28,4 @@ def test_path_resolution_fallback_on_posix() -> None:
         assert "data" in str(resolved_db)
         assert "data" in str(resolved_log)
         assert not str(resolved_db).startswith("D:")
+

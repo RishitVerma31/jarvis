@@ -53,3 +53,4 @@ async def test_health_check_degraded_when_ollama_offline(
     assert data["ollama"]["status"] == "unavailable"
     assert data["ollama"]["model_available"] is False
     assert "unreachable" in data["ollama"]["detail"]
+

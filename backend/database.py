@@ -92,3 +92,4 @@ async def check_db_health() -> bool:
     except Exception as exc:  # pylint: disable=broad-except
         logger.error("Database health check failed: %s", exc)
         return False
+
