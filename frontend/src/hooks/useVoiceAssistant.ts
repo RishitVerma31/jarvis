@@ -92,6 +92,7 @@ export function useVoiceAssistant() {
   const currentTurnIdRef = useRef<number>(0);
   const settledTurnIdRef = useRef<number | null>(null);
   const retryCountPerTurnRef = useRef<Map<number, number>>(new Map());
+  const hasInitializedStartupRef = useRef<boolean>(false);
 
   // Keep ref to latest session ID without triggering effect re-execution
   const activeSessionIdRef = useRef<string | null>(activeSessionId);
@@ -244,31 +245,56 @@ export function useVoiceAssistant() {
   const handleServerEvent = useCallback(
     (event: VoiceServerEvent) => {
       switch (event.type) {
-        case 'state_change':
+        case 'state_change': {
+          // 1. Guard against stale or unversioned turn events BEFORE modifying any UI or audio state.
+          // Legitimate initial events occur ONLY ONCE during startup initialization.
+          const isInitialEvent =
+            !hasInitializedStartupRef.current &&
+            (Boolean(event.initial) ||
+              (currentTurnIdRef.current === 0 && (event.turn_id === undefined || event.turn_id === 0)));
+
+          if (isInitialEvent) {
+            hasInitializedStartupRef.current = true;
+          } else {
+            // Missing turn_id on active session events is rejected
+            if (event.turn_id === undefined) {
+              console.warn(
+                `[VoiceAssistant] Rejecting unversioned state_change (${event.state}) during active turn ${currentTurnIdRef.current}:`,
+                event
+              );
+              break;
+            }
+
+            // Older turn_id is strictly rejected, EVEN IF the event carries initial: true
+            if (event.turn_id < currentTurnIdRef.current) {
+              console.warn(
+                `[VoiceAssistant] Rejecting stale state_change (${event.state}) for turn ${event.turn_id} (active turn is ${currentTurnIdRef.current}):`,
+                event
+              );
+              break;
+            }
+          }
+
+          // 2. Event is valid: advance currentTurnIdRef if the event brings a newer turn_id
+          if (event.turn_id !== undefined && event.turn_id > currentTurnIdRef.current) {
+            currentTurnIdRef.current = event.turn_id;
+          }
+
+          // Clear any pending ack timeout timer if we received a valid WAKE_LISTENING transition for current turn
+          if (event.state === 'WAKE_LISTENING' && ackTimeoutTimerRef.current) {
+            clearTimeout(ackTimeoutTimerRef.current);
+            ackTimeoutTimerRef.current = null;
+          }
+
+          // 3. Mutate React UI state (only reached if event passed validation)
           setVoiceState(event.state);
           if (event.message) {
             setStatusMessage(event.message);
           }
           setIsFollowUp(Boolean(event.follow_up));
 
-          // 1. States where microphone PCM streaming MUST remain active: WAKE_LISTENING, RECORDING
+          // 4. States where microphone PCM streaming MUST remain active: WAKE_LISTENING, RECORDING
           if (event.state === 'WAKE_LISTENING' || event.state === 'RECORDING') {
-            if (event.state === 'WAKE_LISTENING') {
-              // Guard against stale turn acknowledgements
-              if (
-                event.turn_id !== undefined &&
-                event.turn_id !== currentTurnIdRef.current
-              ) {
-                break;
-              }
-
-              // Clear any pending ack timeout timer
-              if (ackTimeoutTimerRef.current) {
-                clearTimeout(ackTimeoutTimerRef.current);
-                ackTimeoutTimerRef.current = null;
-              }
-            }
-
             // Restore iOS audio session to play-and-record for voice input
             setAudioSessionType('play-and-record');
 
@@ -282,7 +308,7 @@ export function useVoiceAssistant() {
             // Resume/keep PCM streaming active to WebSocket
             isStreamingPausedRef.current = false;
 
-          // 2. States where microphone PCM streaming MUST be paused: TRANSCRIBING, PROCESSING, SPEAKING, MUTED
+          // 5. States where microphone PCM streaming MUST be paused: TRANSCRIBING, PROCESSING, SPEAKING, MUTED
           } else if (
             event.state === 'TRANSCRIBING' ||
             event.state === 'PROCESSING' ||
@@ -347,6 +373,7 @@ export function useVoiceAssistant() {
             }
           }
           break;
+        }
 
         case 'wake_detected':
           setIsFollowUp(false);
@@ -671,6 +698,7 @@ export function useVoiceAssistant() {
       const removeConnectionListener = voiceSocketRef.current.addConnectionListener((connected) => {
         if (!connected) {
           cancelAllSpeech();
+          hasInitializedStartupRef.current = false;
         }
       });
       voiceSocketRef.current.connect();
@@ -689,6 +717,7 @@ export function useVoiceAssistant() {
         removeEventListener();
         removeConnectionListener();
         stopAudioCapture();
+        hasInitializedStartupRef.current = false;
       };
     } else {
       cancelAllSpeech();
@@ -698,6 +727,8 @@ export function useVoiceAssistant() {
         voiceSocketRef.current.disconnect();
         voiceSocketRef.current = null;
       }
+      hasInitializedStartupRef.current = false;
+      currentTurnIdRef.current = 0;
       setVoiceState('STANDBY');
       setStatusMessage('Voice Assistant offline');
     }

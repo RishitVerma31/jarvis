@@ -1406,31 +1406,74 @@ describe('Kokoro Voice Assistant Integration (Milestone 2, Step 2)', () => {
   });
 
   describe('Phase 1 Conversation Lifecycle: 5-Second Follow-Up Window & Reset Protections', () => {
-    function createFollowUpHarness() {
+    function createFollowUpHarness(initialTurnId = 0) {
       const state = {
         voiceState: 'STANDBY',
         statusMessage: '',
         isFollowUp: false,
         isStreamingPaused: false,
         micTracks: [{ enabled: true }],
+        currentTurnId: initialTurnId,
+        hasInitializedStartup: initialTurnId > 0,
+        ackTimeoutTimer: null,
       };
 
       const handleServerEvent = (event) => {
         switch (event.type) {
-          case 'state_change':
+          case 'state_change': {
+            // 1. Guard against stale or unversioned turn events BEFORE modifying any UI or audio state.
+            // Legitimate initial events occur ONLY ONCE during startup initialization.
+            const isInitialEvent =
+              !state.hasInitializedStartup &&
+              (Boolean(event.initial) ||
+                (state.currentTurnId === 0 && (event.turn_id === undefined || event.turn_id === 0)));
+
+            if (isInitialEvent) {
+              state.hasInitializedStartup = true;
+            } else {
+              if (event.turn_id === undefined) {
+                // Reject unversioned state_change during active turn
+                break;
+              }
+              if (event.turn_id < state.currentTurnId) {
+                // Reject stale state_change
+                break;
+              }
+            }
+
+            // 2. Advance currentTurnId if newer
+            if (event.turn_id !== undefined && event.turn_id > state.currentTurnId) {
+              state.currentTurnId = event.turn_id;
+            }
+
+            // Clear ack timeout timer on valid WAKE_LISTENING
+            if (event.state === 'WAKE_LISTENING' && state.ackTimeoutTimer) {
+              clearTimeout(state.ackTimeoutTimer);
+              state.ackTimeoutTimer = null;
+            }
+
+            // 3. Mutate React UI state (only reached if event passed validation)
             state.voiceState = event.state;
             if (event.message) state.statusMessage = event.message;
             state.isFollowUp = Boolean(event.follow_up);
+
+            // 4. Update hardware and streaming state based on valid state transition
             if (event.state === 'WAKE_LISTENING' || event.state === 'RECORDING') {
               state.micTracks.forEach((t) => { t.enabled = true; });
               state.isStreamingPaused = false;
-            } else {
+            } else if (
+              event.state === 'TRANSCRIBING' ||
+              event.state === 'PROCESSING' ||
+              event.state === 'SPEAKING' ||
+              event.state === 'MUTED'
+            ) {
               if (event.state === 'SPEAKING' || event.state === 'MUTED') {
                 state.micTracks.forEach((t) => { t.enabled = false; });
               }
               state.isStreamingPaused = true;
             }
             break;
+          }
           case 'wake_detected':
             state.isFollowUp = false;
             state.voiceState = 'WAKE_DETECTED';
@@ -1438,6 +1481,7 @@ describe('Kokoro Voice Assistant Integration (Milestone 2, Step 2)', () => {
           case 'chat_response':
             state.isFollowUp = false;
             state.voiceState = 'SPEAKING';
+            if (event.turn_id !== undefined) state.currentTurnId = event.turn_id;
             break;
           case 'empty_speech':
             state.isFollowUp = false;
@@ -1450,18 +1494,30 @@ describe('Kokoro Voice Assistant Integration (Milestone 2, Step 2)', () => {
       };
 
       const emergencyStop = () => {
+        state.currentTurnId += 1;
         state.isFollowUp = false;
         state.voiceState = 'WAKE_LISTENING';
         state.statusMessage = 'Emergency stop triggered. Standing by.';
       };
 
       const stopSpeaking = () => {
+        state.currentTurnId += 1;
         state.isFollowUp = false;
         state.voiceState = 'WAKE_LISTENING';
         state.statusMessage = 'Standing by. Listening for "Hey Jarvis".';
       };
 
-      return { state, handleServerEvent, emergencyStop, stopSpeaking };
+      const teardown = () => {
+        state.hasInitializedStartup = false;
+        state.currentTurnId = 0;
+        state.voiceState = 'STANDBY';
+        state.statusMessage = '';
+        state.isFollowUp = false;
+        state.isStreamingPaused = false;
+        state.micTracks.forEach((t) => { t.enabled = true; });
+      };
+
+      return { state, handleServerEvent, emergencyStop, stopSpeaking, teardown };
     }
 
     it('1. tts_completed acknowledgement arms follow-up mode with active streaming', () => {
@@ -1483,12 +1539,13 @@ describe('Kokoro Voice Assistant Integration (Milestone 2, Step 2)', () => {
     });
 
     it('2. follow-up expiration returns to standby without streaming disruption', () => {
-      const { state, handleServerEvent } = createFollowUpHarness();
+      const { state, handleServerEvent } = createFollowUpHarness(1);
       handleServerEvent({
         type: 'state_change',
         state: 'WAKE_LISTENING',
         message: 'Listening for follow-up (5s)...',
         follow_up: true,
+        turn_id: 1,
       });
       assert.strictEqual(state.isFollowUp, true);
 
@@ -1497,6 +1554,7 @@ describe('Kokoro Voice Assistant Integration (Milestone 2, Step 2)', () => {
         state: 'WAKE_LISTENING',
         message: "Listening for 'Hey Jarvis'.",
         follow_up: false,
+        turn_id: 1,
       });
       assert.strictEqual(state.isFollowUp, false);
       assert.strictEqual(state.voiceState, 'WAKE_LISTENING');
@@ -1506,12 +1564,13 @@ describe('Kokoro Voice Assistant Integration (Milestone 2, Step 2)', () => {
     });
 
     it('3. speech in follow-up transitions to RECORDING and clears follow-up flag', () => {
-      const { state, handleServerEvent } = createFollowUpHarness();
+      const { state, handleServerEvent } = createFollowUpHarness(1);
       handleServerEvent({
         type: 'state_change',
         state: 'WAKE_LISTENING',
         message: 'Listening for follow-up (5s)...',
         follow_up: true,
+        turn_id: 1,
       });
       assert.strictEqual(state.isFollowUp, true);
 
@@ -1519,6 +1578,7 @@ describe('Kokoro Voice Assistant Integration (Milestone 2, Step 2)', () => {
         type: 'state_change',
         state: 'RECORDING',
         message: 'Listening for your command...',
+        turn_id: 1,
       });
       assert.strictEqual(state.isFollowUp, false);
       assert.strictEqual(state.voiceState, 'RECORDING');
@@ -1526,11 +1586,12 @@ describe('Kokoro Voice Assistant Integration (Milestone 2, Step 2)', () => {
     });
 
     it('4. emergency stop immediately cancels follow-up mode', () => {
-      const { state, handleServerEvent, emergencyStop } = createFollowUpHarness();
+      const { state, handleServerEvent, emergencyStop } = createFollowUpHarness(1);
       handleServerEvent({
         type: 'state_change',
         state: 'WAKE_LISTENING',
         follow_up: true,
+        turn_id: 1,
       });
       assert.strictEqual(state.isFollowUp, true);
 
@@ -1540,11 +1601,12 @@ describe('Kokoro Voice Assistant Integration (Milestone 2, Step 2)', () => {
     });
 
     it('5. stopSpeaking immediately cancels follow-up mode', () => {
-      const { state, handleServerEvent, stopSpeaking } = createFollowUpHarness();
+      const { state, handleServerEvent, stopSpeaking } = createFollowUpHarness(1);
       handleServerEvent({
         type: 'state_change',
         state: 'WAKE_LISTENING',
         follow_up: true,
+        turn_id: 1,
       });
       assert.strictEqual(state.isFollowUp, true);
 
@@ -1554,11 +1616,12 @@ describe('Kokoro Voice Assistant Integration (Milestone 2, Step 2)', () => {
     });
 
     it('6. empty_speech or error resets follow-up state', () => {
-      const { state, handleServerEvent } = createFollowUpHarness();
+      const { state, handleServerEvent } = createFollowUpHarness(1);
       handleServerEvent({
         type: 'state_change',
         state: 'WAKE_LISTENING',
         follow_up: true,
+        turn_id: 1,
       });
       assert.strictEqual(state.isFollowUp, true);
 
@@ -1569,12 +1632,264 @@ describe('Kokoro Voice Assistant Integration (Milestone 2, Step 2)', () => {
         type: 'state_change',
         state: 'WAKE_LISTENING',
         follow_up: true,
+        turn_id: 2,
       });
       assert.strictEqual(state.isFollowUp, true);
 
       handleServerEvent({ type: 'error', message: 'Voice processing error.' });
       assert.strictEqual(state.isFollowUp, false);
       assert.strictEqual(state.voiceState, 'ERROR');
+    });
+
+    it('7. stale WAKE_LISTENING event does not mutate UI state, audio session, or microphone tracks', () => {
+      // Initialize harness in turn 2 while SPEAKING
+      const { state, handleServerEvent } = createFollowUpHarness(2);
+      handleServerEvent({
+        type: 'state_change',
+        state: 'SPEAKING',
+        message: 'Speaking response...',
+        turn_id: 2,
+      });
+      assert.strictEqual(state.voiceState, 'SPEAKING');
+      assert.strictEqual(state.isStreamingPaused, true);
+      assert.strictEqual(state.micTracks[0].enabled, false);
+      assert.strictEqual(state.statusMessage, 'Speaking response...');
+
+      // Delayed stale WAKE_LISTENING arrives from turn 1
+      handleServerEvent({
+        type: 'state_change',
+        state: 'WAKE_LISTENING',
+        message: 'Listening for follow-up...',
+        follow_up: true,
+        turn_id: 1,
+      });
+
+      // UI state and hardware controls MUST remain untouched
+      assert.strictEqual(state.voiceState, 'SPEAKING', 'UI state must not revert on stale WAKE_LISTENING');
+      assert.strictEqual(state.statusMessage, 'Speaking response...', 'Status message must not be overwritten by stale event');
+      assert.strictEqual(state.isFollowUp, false, 'Follow-up flag must not be toggled by stale event');
+      assert.strictEqual(state.micTracks[0].enabled, false, 'Microphone tracks must remain muted');
+      assert.strictEqual(state.isStreamingPaused, true, 'Streaming must remain paused');
+      assert.strictEqual(state.currentTurnId, 2, 'Current turn ID must not be decremented');
+    });
+
+    it('8. stale RECORDING event cannot unmute microphone or resume streaming', () => {
+      // Assistant is user-muted in turn 2
+      const { state, handleServerEvent } = createFollowUpHarness(2);
+      handleServerEvent({
+        type: 'state_change',
+        state: 'MUTED',
+        message: 'Microphone muted.',
+        turn_id: 2,
+      });
+      assert.strictEqual(state.voiceState, 'MUTED');
+      assert.strictEqual(state.micTracks[0].enabled, false);
+      assert.strictEqual(state.isStreamingPaused, true);
+
+      // Delayed stale RECORDING from turn 1 arrives
+      handleServerEvent({
+        type: 'state_change',
+        state: 'RECORDING',
+        message: 'Listening for your command...',
+        turn_id: 1,
+      });
+
+      // Microphone and streaming MUST NOT unmute
+      assert.strictEqual(state.voiceState, 'MUTED', 'State must remain MUTED');
+      assert.strictEqual(state.micTracks[0].enabled, false, 'Mic must remain muted against acoustic loopback');
+      assert.strictEqual(state.isStreamingPaused, true, 'PCM streaming must remain paused');
+      assert.strictEqual(state.statusMessage, 'Microphone muted.');
+    });
+
+    it('9. missing turn_id is handled strictly per event policy: initial accepted, active session rejected', () => {
+      // 1. Initial connection with initial: true or startup turn 0 is accepted
+      const { state, handleServerEvent } = createFollowUpHarness(0);
+      handleServerEvent({
+        type: 'state_change',
+        state: 'WAKE_LISTENING',
+        message: 'Connected to Jarvis Voice. Listening for "Hey Jarvis".',
+        initial: true,
+      });
+      assert.strictEqual(state.voiceState, 'WAKE_LISTENING');
+      assert.strictEqual(state.isStreamingPaused, false);
+      assert.strictEqual(state.micTracks[0].enabled, true);
+
+      // 2. Once in active session (turn 2, processing), unversioned event without turn_id is rejected
+      state.currentTurnId = 2;
+      handleServerEvent({
+        type: 'state_change',
+        state: 'PROCESSING',
+        message: 'Jarvis is processing...',
+        turn_id: 2,
+      });
+      assert.strictEqual(state.voiceState, 'PROCESSING');
+      assert.strictEqual(state.isStreamingPaused, true);
+
+      // Bogus unversioned event
+      handleServerEvent({
+        type: 'state_change',
+        state: 'WAKE_LISTENING',
+        message: 'Unversioned rogue event',
+        // turn_id omitted!
+      });
+      assert.strictEqual(state.voiceState, 'PROCESSING', 'Unversioned event must be rejected during active turn');
+      assert.strictEqual(state.isStreamingPaused, true);
+    });
+
+    it('10. valid newer exit-command event restores standby correctly', () => {
+      const { state, handleServerEvent } = createFollowUpHarness(1);
+      // Turn 1 follow-up active
+      handleServerEvent({
+        type: 'state_change',
+        state: 'WAKE_LISTENING',
+        message: 'Listening for follow-up...',
+        follow_up: true,
+        turn_id: 1,
+      });
+      assert.strictEqual(state.isFollowUp, true);
+      assert.strictEqual(state.currentTurnId, 1);
+
+      // User says exit command; backend concludes turn 2 and transitions to standby
+      handleServerEvent({
+        type: 'state_change',
+        state: 'WAKE_LISTENING',
+        message: "Standing by. Listening for 'Hey Jarvis'.",
+        follow_up: false,
+        turn_id: 2,
+      });
+
+      assert.strictEqual(state.voiceState, 'WAKE_LISTENING');
+      assert.strictEqual(state.currentTurnId, 2, 'Current turn ID must update to 2');
+      assert.strictEqual(state.isFollowUp, false, 'Follow-up flag must be cleared');
+      assert.strictEqual(state.isStreamingPaused, false, 'Streaming must be active for wake word detection');
+      assert.strictEqual(state.micTracks[0].enabled, true, 'Microphone tracks must be enabled');
+      assert.strictEqual(state.statusMessage, "Standing by. Listening for 'Hey Jarvis'.");
+    });
+
+    it('11. valid newer follow-up-expiration event restores standby correctly', () => {
+      const { state, handleServerEvent } = createFollowUpHarness(1);
+      // Follow-up active for turn 1
+      handleServerEvent({
+        type: 'state_change',
+        state: 'WAKE_LISTENING',
+        follow_up: true,
+        turn_id: 1,
+      });
+      assert.strictEqual(state.isFollowUp, true);
+
+      // Expiration event for turn 1 arrives
+      handleServerEvent({
+        type: 'state_change',
+        state: 'WAKE_LISTENING',
+        message: "Listening for 'Hey Jarvis'.",
+        follow_up: false,
+        turn_id: 1,
+      });
+
+      assert.strictEqual(state.voiceState, 'WAKE_LISTENING');
+      assert.strictEqual(state.isFollowUp, false, 'Follow-up badge must be cleared');
+      assert.strictEqual(state.isStreamingPaused, false, 'Streaming must be active');
+      assert.strictEqual(state.statusMessage, "Listening for 'Hey Jarvis'.");
+    });
+
+    it('12. initial connection event is accepted exactly once during genuine startup', () => {
+      const { state, handleServerEvent } = createFollowUpHarness(0);
+      assert.strictEqual(state.hasInitializedStartup, false);
+      assert.strictEqual(state.voiceState, 'STANDBY');
+
+      // Genuine initial connection event
+      handleServerEvent({
+        type: 'state_change',
+        state: 'WAKE_LISTENING',
+        message: "Connected to Jarvis Voice. Listening for 'Hey Jarvis'.",
+        initial: true,
+        turn_id: 0,
+      });
+
+      assert.strictEqual(state.hasInitializedStartup, true, 'Startup latch must be set');
+      assert.strictEqual(state.voiceState, 'WAKE_LISTENING');
+      assert.strictEqual(state.currentTurnId, 0);
+      assert.strictEqual(state.isStreamingPaused, false);
+      assert.strictEqual(state.micTracks[0].enabled, true);
+    });
+
+    it('13. delayed initial event with initial:true after Turn 1 is rejected with zero mutations', () => {
+      const { state, handleServerEvent } = createFollowUpHarness(0);
+
+      // 1. Initial connection
+      handleServerEvent({
+        type: 'state_change',
+        state: 'WAKE_LISTENING',
+        message: "Connected to Jarvis Voice. Listening for 'Hey Jarvis'.",
+        initial: true,
+        turn_id: 0,
+      });
+      assert.strictEqual(state.hasInitializedStartup, true);
+
+      // 2. Advance to Turn 1 SPEAKING
+      handleServerEvent({
+        type: 'state_change',
+        state: 'SPEAKING',
+        message: 'Jarvis speaking...',
+        turn_id: 1,
+      });
+      assert.strictEqual(state.voiceState, 'SPEAKING');
+      assert.strictEqual(state.currentTurnId, 1);
+      assert.strictEqual(state.isStreamingPaused, true);
+      assert.strictEqual(state.micTracks[0].enabled, false);
+
+      // 3. Delayed initial event with turn_id 0 and initial: true arrives
+      handleServerEvent({
+        type: 'state_change',
+        state: 'WAKE_LISTENING',
+        message: "Connected to Jarvis Voice. Listening for 'Hey Jarvis'.",
+        initial: true,
+        turn_id: 0,
+      });
+
+      // Must NOT mutate state, must NOT unmute mic, must NOT resume streaming
+      assert.strictEqual(state.voiceState, 'SPEAKING', 'Delayed initial event must not overwrite current state');
+      assert.strictEqual(state.currentTurnId, 1, 'Turn ID must remain 1');
+      assert.strictEqual(state.isStreamingPaused, true, 'Streaming must remain paused');
+      assert.strictEqual(state.micTracks[0].enabled, false, 'Mic must remain muted during SPEAKING');
+    });
+
+    it('14. fresh connection initializes successfully after genuine teardown', () => {
+      const { state, handleServerEvent, teardown } = createFollowUpHarness(0);
+
+      // 1. First connection
+      handleServerEvent({
+        type: 'state_change',
+        state: 'WAKE_LISTENING',
+        initial: true,
+        turn_id: 0,
+      });
+      assert.strictEqual(state.hasInitializedStartup, true);
+
+      // 2. Advance to Turn 1
+      handleServerEvent({
+        type: 'state_change',
+        state: 'WAKE_LISTENING',
+        turn_id: 1,
+      });
+      assert.strictEqual(state.currentTurnId, 1);
+
+      // 3. Genuine teardown occurs (e.g. socket disconnect or voice mode deactivated)
+      teardown();
+      assert.strictEqual(state.hasInitializedStartup, false);
+      assert.strictEqual(state.currentTurnId, 0);
+
+      // 4. Fresh connection initialization
+      handleServerEvent({
+        type: 'state_change',
+        state: 'WAKE_LISTENING',
+        message: "Connected to Jarvis Voice. Listening for 'Hey Jarvis'.",
+        initial: true,
+        turn_id: 0,
+      });
+      assert.strictEqual(state.hasInitializedStartup, true, 'New connection must set startup latch');
+      assert.strictEqual(state.voiceState, 'WAKE_LISTENING');
+      assert.strictEqual(state.currentTurnId, 0);
     });
   });
 });

@@ -336,9 +336,23 @@ class VoiceService:
         if score >= self.threshold and cooldown_elapsed:
             self.last_wake_time = now
             logger.info("Wake-word detected! Model: '%s', Score: %.3f", self.wake_model_key, score)
+            self.reset_wake_word()
             return True, score
 
         return False, score
+
+    def reset_wake_word(self) -> None:
+        """Reset internal openWakeWord feature and prediction buffers.
+
+        Clears accumulated audio embeddings and prediction queues so that a
+        previously triggered wake phrase or transient noise cannot cause
+        phantom duplicate wake events upon entering standby.
+        """
+        try:
+            if hasattr(self, "wakeword_model") and self.wakeword_model is not None:
+                self.wakeword_model.reset()
+        except Exception as exc:
+            logger.warning("Error resetting openWakeWord model: %s", exc)
 
     def is_speech_frame(self, pcm_frame: bytes) -> bool:
         """Check voice activity on a 30ms (480 samples = 960 bytes) PCM chunk.

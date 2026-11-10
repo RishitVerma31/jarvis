@@ -10,7 +10,7 @@ import json
 import logging
 import time
 from typing import Any
-from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect, status
 from backend.config import get_settings
 from backend.database import get_session_factory
 from backend.security import verify_websocket_ticket
@@ -34,11 +34,32 @@ MAX_RECORDING_SECONDS = 15.0
 INITIAL_SPEECH_TIMEOUT_SECONDS = 4.0
 FOLLOW_UP_TIMEOUT_SECONDS = 5.0
 
+# Singleton voice WebSocket session management
+_active_session_lock = asyncio.Lock()
+_active_voice_socket: WebSocket | None = None
+
 
 async def handle_voice_websocket(websocket: WebSocket) -> None:
     """Core WebSocket handler for audio streaming and state machine management."""
-    await websocket.accept()
-    voice_service = get_voice_service()
+    global _active_voice_socket
+    should_reject = False
+    async with _active_session_lock:
+        if _active_voice_socket is not None:
+            should_reject = True
+        else:
+            _active_voice_socket = websocket
+
+    if should_reject:
+        logger.warning("Rejecting concurrent voice WebSocket connection (session already active).")
+        try:
+            await websocket.accept()
+            await websocket.close(
+                code=status.WS_1008_POLICY_VIOLATION,
+                reason="Voice session already active",
+            )
+        except Exception as exc:
+            logger.debug("Error rejecting concurrent voice connection: %s", exc)
+        return
 
     current_state = "WAKE_LISTENING"
     current_session_id: str | None = None
@@ -48,6 +69,7 @@ async def handle_voice_websocket(websocket: WebSocket) -> None:
     follow_up_active = False
     follow_up_deadline: float | None = None
     last_acknowledged_turn_id: int | None = None
+    voice_service: Any = None
 
     # Buffers (strictly in-memory bytearrays; no recordings stored on disk)
     wake_buffer = bytearray()
@@ -108,11 +130,13 @@ async def handle_voice_websocket(websocket: WebSocket) -> None:
                     speech_buffer.clear()
                     speech_only_buffer.clear()
                     vad_buffer.clear()
+                    voice_service.reset_wake_word()
                     await websocket.send_json({
                         "type": "state_change",
                         "state": "WAKE_LISTENING",
                         "message": "Listening for 'Hey Jarvis'.",
                         "follow_up": False,
+                        "turn_id": turn_id,
                     })
             except asyncio.CancelledError:
                 pass
@@ -129,13 +153,6 @@ async def handle_voice_websocket(websocket: WebSocket) -> None:
         now = time.monotonic()
         follow_up_deadline = now + FOLLOW_UP_TIMEOUT_SECONDS
         _schedule_follow_up_timer(turn_id, FOLLOW_UP_TIMEOUT_SECONDS)
-
-    logger.info("Client connected to voice WebSocket.")
-    await websocket.send_json({
-        "type": "state_change",
-        "state": current_state,
-        "message": "Connected to Jarvis Voice. Listening for 'Hey Jarvis'.",
-    })
 
     async def _process_turn(turn_id: int, audio_bytes: bytes) -> None:
         nonlocal current_state, current_session_id, follow_up_active, follow_up_speech_frames, follow_up_deadline
@@ -165,15 +182,22 @@ async def handle_voice_websocket(websocket: WebSocket) -> None:
                         "state": current_state,
                         "message": "Listening for follow-up...",
                         "follow_up": True,
+                        "turn_id": turn_id,
                     })
                 else:
                     _clear_follow_up()
+                    wake_buffer.clear()
+                    speech_buffer.clear()
+                    speech_only_buffer.clear()
+                    vad_buffer.clear()
+                    voice_service.reset_wake_word()
                     current_state = "WAKE_LISTENING"
                     await websocket.send_json({
                         "type": "state_change",
                         "state": current_state,
                         "message": "Listening for 'Hey Jarvis'.",
                         "follow_up": False,
+                        "turn_id": turn_id,
                     })
                 return
 
@@ -190,12 +214,14 @@ async def handle_voice_websocket(websocket: WebSocket) -> None:
                 speech_buffer.clear()
                 speech_only_buffer.clear()
                 vad_buffer.clear()
+                voice_service.reset_wake_word()
                 current_state = "WAKE_LISTENING"
                 await websocket.send_json({
                     "type": "state_change",
                     "state": current_state,
                     "message": "Standing by. Listening for 'Hey Jarvis'.",
                     "follow_up": False,
+                    "turn_id": turn_id,
                 })
                 return
 
@@ -217,6 +243,7 @@ async def handle_voice_websocket(websocket: WebSocket) -> None:
                 "type": "state_change",
                 "state": current_state,
                 "message": "Jarvis is processing your request...",
+                "turn_id": turn_id,
             })
 
             # Generate unique session ID if not set
@@ -299,6 +326,7 @@ async def handle_voice_websocket(websocket: WebSocket) -> None:
                 "type": "state_change",
                 "state": current_state,
                 "message": "Speaking response...",
+                "turn_id": turn_id,
             })
 
         except asyncio.CancelledError:
@@ -316,11 +344,25 @@ async def handle_voice_websocket(websocket: WebSocket) -> None:
                         "state": current_state,
                         "message": "Listening for 'Hey Jarvis'.",
                         "follow_up": False,
+                        "turn_id": turn_id,
                     })
                 except Exception:
                     pass
 
     try:
+        await websocket.accept()
+        voice_service = get_voice_service()
+        voice_service.reset_wake_word()
+
+        logger.info("Client connected to voice WebSocket.")
+        await websocket.send_json({
+            "type": "state_change",
+            "state": current_state,
+            "message": "Connected to Jarvis Voice. Listening for 'Hey Jarvis'.",
+            "initial": True,
+            "turn_id": 0,
+        })
+
         while True:
             msg = await websocket.receive()
 
@@ -348,23 +390,28 @@ async def handle_voice_websocket(websocket: WebSocket) -> None:
                         speech_buffer.clear()
                         speech_only_buffer.clear()
                         vad_buffer.clear()
+                        voice_service.reset_wake_word()
                         await websocket.send_json({
                             "type": "state_change",
                             "state": current_state,
                             "message": "Microphone muted.",
+                            "turn_id": current_turn_id,
                         })
 
                     elif event_type == "unmute":
                         _clear_follow_up()
+                        current_turn_id += 1
                         current_state = "WAKE_LISTENING"
                         wake_buffer.clear()
                         speech_buffer.clear()
                         speech_only_buffer.clear()
                         vad_buffer.clear()
+                        voice_service.reset_wake_word()
                         await websocket.send_json({
                             "type": "state_change",
                             "state": current_state,
                             "message": "Listening for 'Hey Jarvis'.",
+                            "turn_id": current_turn_id,
                         })
 
                     elif event_type in ("emergency_stop", "stop_speaking"):
@@ -378,11 +425,14 @@ async def handle_voice_websocket(websocket: WebSocket) -> None:
                         speech_buffer.clear()
                         speech_only_buffer.clear()
                         vad_buffer.clear()
+                        voice_service.reset_wake_word()
                         current_state = "WAKE_LISTENING"
                         await websocket.send_json({
                             "type": "state_change",
                             "state": current_state,
                             "message": "Stopped. Listening for 'Hey Jarvis'.",
+                            "follow_up": False,
+                            "turn_id": current_turn_id,
                         })
 
                     elif event_type == "tts_completed":
@@ -413,6 +463,7 @@ async def handle_voice_websocket(websocket: WebSocket) -> None:
                             speech_buffer.clear()
                             speech_only_buffer.clear()
                             vad_buffer.clear()
+                            voice_service.reset_wake_word()
                             current_state = "WAKE_LISTENING"
                             _arm_follow_up(current_turn_id)
 
@@ -550,6 +601,7 @@ async def handle_voice_websocket(websocket: WebSocket) -> None:
                                 "type": "state_change",
                                 "state": current_state,
                                 "message": "Listening for your command...",
+                                "turn_id": current_turn_id,
                             })
                             continue
 
@@ -565,6 +617,8 @@ async def handle_voice_websocket(websocket: WebSocket) -> None:
                             if detected:
                                 logger.info("Wake word triggered! (score=%.3f)", score)
                                 _clear_follow_up()
+                                wake_buffer.clear()
+                                voice_service.reset_wake_word()
                                 await websocket.send_json({
                                     "type": "wake_detected",
                                     "score": score,
@@ -572,7 +626,6 @@ async def handle_voice_websocket(websocket: WebSocket) -> None:
 
                                 # Transition immediately to RECORDING
                                 current_state = "RECORDING"
-                                wake_buffer.clear()
                                 speech_buffer.clear()
                                 speech_only_buffer.clear()
                                 vad_buffer.clear()
@@ -585,6 +638,7 @@ async def handle_voice_websocket(websocket: WebSocket) -> None:
                                     "type": "state_change",
                                     "state": current_state,
                                     "message": "Listening for your command...",
+                                    "turn_id": current_turn_id,
                                 })
                                 break
 
@@ -663,15 +717,19 @@ async def handle_voice_websocket(websocket: WebSocket) -> None:
                                     "state": current_state,
                                     "message": f"Listening for follow-up ({remaining:.1f}s)...",
                                     "follow_up": True,
+                                    "turn_id": current_turn_id,
                                 })
                             else:
                                 _clear_follow_up()
+                                wake_buffer.clear()
+                                voice_service.reset_wake_word()
                                 current_state = "WAKE_LISTENING"
                                 await websocket.send_json({
                                     "type": "state_change",
                                     "state": current_state,
                                     "message": "Listening for 'Hey Jarvis'.",
                                     "follow_up": False,
+                                    "turn_id": current_turn_id,
                                 })
                             continue
 
@@ -684,6 +742,7 @@ async def handle_voice_websocket(websocket: WebSocket) -> None:
                             "type": "state_change",
                             "state": current_state,
                             "message": "Transcribing speech...",
+                            "turn_id": turn_id,
                         })
 
                         # Ensure previous processing task is cancelled if still active
@@ -699,6 +758,8 @@ async def handle_voice_websocket(websocket: WebSocket) -> None:
                         speech_buffer.clear()
                         speech_only_buffer.clear()
                         vad_buffer.clear()
+                        wake_buffer.clear()
+                        voice_service.reset_wake_word()
                         _clear_follow_up()
                         current_state = "WAKE_LISTENING"
                         await websocket.send_json({
@@ -706,6 +767,7 @@ async def handle_voice_websocket(websocket: WebSocket) -> None:
                             "state": current_state,
                             "message": "Listening timeout. Listening for 'Hey Jarvis'.",
                             "follow_up": False,
+                            "turn_id": current_turn_id,
                         })
 
     except WebSocketDisconnect:
@@ -717,6 +779,9 @@ async def handle_voice_websocket(websocket: WebSocket) -> None:
         except Exception:
             pass
     finally:
+        async with _active_session_lock:
+            if _active_voice_socket is websocket:
+                _active_voice_socket = None
         _clear_follow_up()
         if processing_task and not processing_task.done():
             processing_task.cancel()
@@ -728,6 +793,10 @@ async def handle_voice_websocket(websocket: WebSocket) -> None:
         speech_buffer.clear()
         speech_only_buffer.clear()
         vad_buffer.clear()
+        try:
+            get_voice_service().reset_wake_word()
+        except Exception:
+            pass
 
 
 @router.websocket("/ws/voice")

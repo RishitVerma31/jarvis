@@ -6,6 +6,7 @@ import time
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 from fastapi.testclient import TestClient
+from starlette.websockets import WebSocketDisconnect
 from backend.config import Settings
 from backend.main import app
 from backend.security import get_ticket_store
@@ -328,6 +329,8 @@ def test_voice_websocket_lifecycle_and_event_order():
                 "type": "state_change",
                 "state": "WAKE_LISTENING",
                 "message": "Connected to Jarvis Voice. Listening for 'Hey Jarvis'.",
+                "initial": True,
+                "turn_id": 0,
             }
 
             # Step 2-4: Turn through to SPEAKING
@@ -338,6 +341,7 @@ def test_voice_websocket_lifecycle_and_event_order():
                 "type": "state_change",
                 "state": "SPEAKING",
                 "message": "Speaking response...",
+                "turn_id": chat_res["turn_id"],
             }
 
             # Step 5: Client signals TTS completion with turn_id
@@ -446,6 +450,8 @@ def test_voice_websocket_emergency_stop_cancels_active_processing_task():
                 "type": "state_change",
                 "state": "WAKE_LISTENING",
                 "message": "Stopped. Listening for 'Hey Jarvis'.",
+                "follow_up": False,
+                "turn_id": 2,
             }
 
             # Wait to ensure the cancelled background task never emits chat_response or SPEAKING
@@ -1550,4 +1556,332 @@ def test_voice_websocket_legacy_resume_event_cannot_arm_follow_up_or_mutate_stat
             assert ack["turn_id"] == turn_id
             assert ack["state"] == "WAKE_LISTENING"
             assert ack["follow_up"] is True
+
+
+def test_voice_service_reset_wake_word_clears_model():
+    """Verify reset_wake_word calls underlying model reset and predict_wake_word resets on detection."""
+    silence_80ms = bytes(2560)
+    mock_model = MagicMock()
+    mock_model.models = {"hey_jarvis_v0.1": None}
+    mock_model.predict.return_value = {"hey_jarvis_v0.1": 0.90}
+
+    with patch("backend.services.voice_service.WhisperModel"), patch(
+        "backend.services.voice_service.Model", return_value=mock_model
+    ):
+        vs = VoiceService()
+        vs.reset_wake_word()
+        mock_model.reset.assert_called_once()
+
+        mock_model.reset.reset_mock()
+        # When wake word is detected, predict_wake_word must automatically invoke reset_wake_word()
+        detected, score = vs.predict_wake_word(silence_80ms)
+        assert detected is True
+        assert score == 0.90
+        mock_model.reset.assert_called_once()
+
+
+def test_voice_websocket_sequence_a_empty_wake_attempt():
+    """Sequence A: standby -> wake -> silence (timeout) -> standby without LLM."""
+    mock_vs = MagicMock()
+    mock_vs.predict_wake_word.return_value = (True, 0.95)
+    mock_vs.is_speech_frame.return_value = False
+    mock_chat = AsyncMock()
+
+    client = TestClient(app)
+    with patch("backend.routers.voice.INITIAL_SPEECH_TIMEOUT_SECONDS", 0.05), \
+         patch("backend.routers.voice.get_voice_service", return_value=mock_vs), \
+         patch("backend.routers.voice.ChatService.process_chat", mock_chat), \
+         patch("backend.routers.voice.get_settings", return_value=Settings(ENABLE_KOKORO_TTS=False)):
+        with client.websocket_connect(f"/ws/voice?ticket={get_test_ws_ticket()}") as ws:
+            ws.receive_json()  # initial WAKE_LISTENING
+
+            # Wake word triggers
+            ws.send_bytes(bytes(2560))
+            assert ws.receive_json()["type"] == "wake_detected"
+            assert ws.receive_json()["state"] == "RECORDING"
+
+            # User remains silent; send silence frames past INITIAL_SPEECH_TIMEOUT_SECONDS
+            time.sleep(0.06)
+            ws.send_bytes(bytes(960))
+
+            timeout_state = ws.receive_json()
+            assert timeout_state["type"] == "state_change"
+            assert timeout_state["state"] == "WAKE_LISTENING"
+            assert timeout_state["follow_up"] is False
+            assert "timeout" in timeout_state["message"].lower()
+
+            mock_chat.assert_not_called()
+            mock_vs.reset_wake_word.assert_called()
+
+
+def test_voice_websocket_sequence_b_normal_follow_up_expiration():
+    """Sequence B: standby -> wake -> recording -> answer -> follow-up (5s) -> silence -> standby."""
+    mock_vs, mock_chat_res = _get_mock_voice_services()
+    client = TestClient(app)
+    with patch("backend.routers.voice.SILENCE_TIMEOUT_SECONDS", 0.05), \
+         patch("backend.routers.voice.FOLLOW_UP_TIMEOUT_SECONDS", 0.1), \
+         patch("backend.routers.voice.get_voice_service", return_value=mock_vs), \
+         patch("backend.routers.voice.ChatService.process_chat", new_callable=AsyncMock, return_value=mock_chat_res), \
+         patch("backend.routers.voice.get_settings", return_value=Settings(ENABLE_KOKORO_TTS=False)):
+        with client.websocket_connect(f"/ws/voice?ticket={get_test_ws_ticket()}") as ws:
+            ws.receive_json()
+            chat_res, _ = _simulate_voice_turn(ws)
+            turn_id = chat_res["turn_id"]
+
+            ws.send_json({"type": "tts_completed", "turn_id": turn_id})
+            ack = ws.receive_json()
+            assert ack["follow_up"] is True
+
+            # Expiration
+            time.sleep(0.15)
+            expired = ws.receive_json()
+            assert expired["type"] == "state_change"
+            assert expired["state"] == "WAKE_LISTENING"
+            assert expired["follow_up"] is False
+            assert expired["turn_id"] == turn_id
+            mock_vs.reset_wake_word.assert_called()
+
+
+def test_voice_websocket_sequence_c_and_d_exit_commands():
+    """Sequences C & D: standby -> wake -> answer -> follow-up -> exit commands ('Thank you' & 'That's all') -> standby."""
+    for phrase in ["Thank you", "That's all"]:
+        mock_vs, mock_chat_res = _get_mock_voice_services()
+        mock_vs.is_speech_frame.side_effect = (
+            [True, True, True, True, False] +  # Turn 1
+            [True, True, True, True, False] +  # Turn 2
+            [False] * 50
+        )
+        mock_vs.transcribe_pcm = AsyncMock(side_effect=[
+            ("hello jarvis", 45.0),
+            (phrase, 30.0),
+        ])
+        mock_chat = AsyncMock(return_value=mock_chat_res)
+
+        client = TestClient(app)
+        with patch("backend.routers.voice.SILENCE_TIMEOUT_SECONDS", 0.05), \
+             patch("backend.routers.voice.FOLLOW_UP_TIMEOUT_SECONDS", 2.0), \
+             patch("backend.routers.voice.get_voice_service", return_value=mock_vs), \
+             patch("backend.routers.voice.ChatService.process_chat", mock_chat), \
+             patch("backend.routers.voice.get_settings", return_value=Settings(ENABLE_KOKORO_TTS=False)):
+            with client.websocket_connect(f"/ws/voice?ticket={get_test_ws_ticket()}") as ws:
+                ws.receive_json()
+                chat_res1, _ = _simulate_voice_turn(ws)
+                turn_1 = chat_res1["turn_id"]
+
+                # Arm follow-up
+                ws.send_json({"type": "tts_completed", "turn_id": turn_1})
+                assert ws.receive_json()["follow_up"] is True
+
+                # User speaks exit command during follow-up
+                speech_frame = _make_speech_frame(rms=700.0)
+                for _ in range(4):
+                    ws.send_bytes(speech_frame)
+                time.sleep(0.06)
+                ws.send_bytes(bytes(960))
+
+                assert ws.receive_json()["state"] == "RECORDING"
+                assert ws.receive_json()["state"] == "TRANSCRIBING"
+
+                tr = ws.receive_json()
+                assert tr["type"] == "transcription"
+                assert tr["text"] == phrase
+
+                standby = ws.receive_json()
+                assert standby["type"] == "state_change"
+                assert standby["state"] == "WAKE_LISTENING"
+                assert standby["follow_up"] is False
+                assert standby["turn_id"] == 2
+                assert "Standing by" in standby["message"]
+
+                # LLM must only have been called for Turn 1, NOT for the exit command!
+                assert mock_chat.call_count == 1
+                mock_vs.reset_wake_word.assert_called()
+
+
+def test_voice_websocket_sequence_f_false_exit_phrase_continues_to_llm():
+    """Sequence F: False exit phrase ('Please don't stop explaining') proceeds to normal LLM processing."""
+    mock_vs, mock_chat_res = _get_mock_voice_services()
+    mock_vs.is_speech_frame.side_effect = (
+        [True, True, True, True, False] +  # Turn 1
+        [True, True, True, True, False] +  # Turn 2
+        [False] * 50
+    )
+    mock_vs.transcribe_pcm = AsyncMock(side_effect=[
+        ("hello jarvis", 45.0),
+        ("Please don't stop explaining", 40.0),
+    ])
+    mock_chat = AsyncMock(return_value=mock_chat_res)
+
+    client = TestClient(app)
+    with patch("backend.routers.voice.SILENCE_TIMEOUT_SECONDS", 0.05), \
+         patch("backend.routers.voice.FOLLOW_UP_TIMEOUT_SECONDS", 2.0), \
+         patch("backend.routers.voice.get_voice_service", return_value=mock_vs), \
+         patch("backend.routers.voice.ChatService.process_chat", mock_chat), \
+         patch("backend.routers.voice.get_settings", return_value=Settings(ENABLE_KOKORO_TTS=False)):
+        with client.websocket_connect(f"/ws/voice?ticket={get_test_ws_ticket()}") as ws:
+            ws.receive_json()
+            chat_res1, _ = _simulate_voice_turn(ws)
+            turn_1 = chat_res1["turn_id"]
+
+            ws.send_json({"type": "tts_completed", "turn_id": turn_1})
+            assert ws.receive_json()["follow_up"] is True
+
+            speech_frame = _make_speech_frame(rms=700.0)
+            for _ in range(4):
+                ws.send_bytes(speech_frame)
+            time.sleep(0.06)
+            ws.send_bytes(bytes(960))
+
+            assert ws.receive_json()["state"] == "RECORDING"
+            assert ws.receive_json()["state"] == "TRANSCRIBING"
+
+            tr = ws.receive_json()
+            assert tr["type"] == "transcription"
+            assert tr["text"] == "Please don't stop explaining"
+
+            # Must proceed to PROCESSING and SPEAKING via LLM
+            assert ws.receive_json()["state"] == "PROCESSING"
+            res2 = ws.receive_json()
+            assert res2["type"] == "chat_response"
+            assert ws.receive_json()["state"] == "SPEAKING"
+            assert mock_chat.call_count == 2
+
+
+def test_voice_websocket_concurrent_connection_rejected_with_1008():
+    """Verify second concurrent voice WebSocket is rejected with code 1008 and active session continues undisturbed."""
+    client = TestClient(app)
+    with client.websocket_connect(f"/ws/voice?ticket={get_test_ws_ticket()}") as ws1:
+        init1 = ws1.receive_json()
+        assert init1["state"] == "WAKE_LISTENING"
+        assert init1["initial"] is True
+        assert init1["turn_id"] == 0
+
+        # Attempt second simultaneous connection
+        with pytest.raises(WebSocketDisconnect) as exc_info:
+            with client.websocket_connect(f"/ws/voice?ticket={get_test_ws_ticket()}") as ws2:
+                ws2.receive_json()
+
+        assert exc_info.value.code == 1008
+        assert "Voice session already active" in str(exc_info.value.reason)
+
+        # Active session 1 remains completely undisturbed
+        ws1.send_json({"type": "ping"})
+        assert ws1.receive_json()["type"] == "pong"
+
+
+def test_voice_websocket_disconnect_releases_session_guard_allowing_reconnect():
+    """Verify normal disconnect releases the session guard and allows subsequent connections."""
+    client = TestClient(app)
+    with client.websocket_connect(f"/ws/voice?ticket={get_test_ws_ticket()}") as ws1:
+        init1 = ws1.receive_json()
+        assert init1["state"] == "WAKE_LISTENING"
+        ws1.send_json({"type": "ping"})
+        assert ws1.receive_json()["type"] == "pong"
+
+    # After ws1 exits context, ws2 should connect successfully without 1008 rejection
+    with client.websocket_connect(f"/ws/voice?ticket={get_test_ws_ticket()}") as ws2:
+        init2 = ws2.receive_json()
+        assert init2["state"] == "WAKE_LISTENING"
+        ws2.send_json({"type": "ping"})
+        assert ws2.receive_json()["type"] == "pong"
+
+
+def test_voice_websocket_rejected_cleanup_cannot_release_active_session():
+    """Verify rejected connection's cleanup cannot accidentally release the active connection guard."""
+    from backend.routers import voice as voice_router
+
+    client = TestClient(app)
+    with client.websocket_connect(f"/ws/voice?ticket={get_test_ws_ticket()}") as ws1:
+        ws1.receive_json()
+        active_socket_ref = voice_router._active_voice_socket
+        assert active_socket_ref is not None
+
+        # Rejected connection executes its finally block
+        with pytest.raises(WebSocketDisconnect):
+            with client.websocket_connect(f"/ws/voice?ticket={get_test_ws_ticket()}") as ws2:
+                ws2.receive_json()
+
+        # Active session guard MUST still belong to ws1
+        assert voice_router._active_voice_socket is active_socket_ref
+
+        # A third connection must STILL be rejected
+        with pytest.raises(WebSocketDisconnect) as exc_info3:
+            with client.websocket_connect(f"/ws/voice?ticket={get_test_ws_ticket()}") as ws3:
+                ws3.receive_json()
+        assert exc_info3.value.code == 1008
+
+        # ws1 is still alive and responsive
+        ws1.send_json({"type": "ping"})
+        assert ws1.receive_json()["type"] == "pong"
+
+
+def test_voice_websocket_all_state_transitions_carry_turn_ids():
+    """Verify state transitions carry authoritative turn IDs and initial connection is marked."""
+    client = TestClient(app)
+    with client.websocket_connect(f"/ws/voice?ticket={get_test_ws_ticket()}") as ws:
+        # Initial connection
+        init = ws.receive_json()
+        assert init["state"] == "WAKE_LISTENING"
+        assert init["initial"] is True
+        assert init["turn_id"] == 0
+
+        # Mute
+        ws.send_json({"type": "mute"})
+        muted = ws.receive_json()
+        assert muted["state"] == "MUTED"
+        assert muted["turn_id"] == 1
+
+        # Unmute
+        ws.send_json({"type": "unmute"})
+        unmuted = ws.receive_json()
+        assert unmuted["state"] == "WAKE_LISTENING"
+        assert unmuted["turn_id"] == 2
+
+        # Emergency stop
+        ws.send_json({"type": "emergency_stop"})
+        stopped = ws.receive_json()
+        assert stopped["state"] == "WAKE_LISTENING"
+        assert stopped["turn_id"] == 3
+
+
+def test_voice_websocket_accept_failure_releases_session_reservation():
+    """Verify that failure during WebSocket accept releases session reservation."""
+    from unittest.mock import AsyncMock
+    from backend.routers import voice as voice_router
+
+    mock_ws = AsyncMock()
+    mock_ws.accept.side_effect = RuntimeError("Simulated accept failure")
+
+    asyncio.run(voice_router.handle_voice_websocket(mock_ws))
+
+    # Reservation must be released
+    assert voice_router._active_voice_socket is None
+
+    # Subsequent connection via TestClient must succeed cleanly
+    client = TestClient(app)
+    with client.websocket_connect(f"/ws/voice?ticket={get_test_ws_ticket()}") as ws:
+        init = ws.receive_json()
+        assert init["state"] == "WAKE_LISTENING"
+        assert init["turn_id"] == 0
+
+
+def test_voice_websocket_initial_send_failure_releases_session_reservation():
+    """Verify that failure during initial state transmission releases session reservation."""
+    from unittest.mock import AsyncMock
+    from backend.routers import voice as voice_router
+
+    mock_ws = AsyncMock()
+    mock_ws.send_json.side_effect = RuntimeError("Simulated initial send failure")
+
+    asyncio.run(voice_router.handle_voice_websocket(mock_ws))
+
+    # Reservation must be released
+    assert voice_router._active_voice_socket is None
+
+    # Subsequent connection via TestClient must succeed cleanly
+    client = TestClient(app)
+    with client.websocket_connect(f"/ws/voice?ticket={get_test_ws_ticket()}") as ws:
+        init = ws.receive_json()
+        assert init["state"] == "WAKE_LISTENING"
+        assert init["turn_id"] == 0
 

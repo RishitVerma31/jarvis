@@ -25,6 +25,7 @@ export interface VoiceStateChangeEvent {
   message?: string;
   ack?: string;
   turn_id?: number;
+  initial?: boolean;
   follow_up?: boolean;
 }
 
