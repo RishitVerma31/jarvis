@@ -328,7 +328,16 @@ class VoiceService:
             return False, 0.0
 
         audio_np = np.frombuffer(pcm_chunk, dtype=np.int16)
-        predictions = self.wakeword_model.predict(audio_np)
+        patience_dict = {self.wake_model_key: 2} if hasattr(self, "wake_model_key") and self.wake_model_key else {}
+        threshold_dict = {self.wake_model_key: self.threshold} if hasattr(self, "wake_model_key") and self.wake_model_key else {}
+        try:
+            predictions = self.wakeword_model.predict(
+                audio_np,
+                patience=patience_dict,
+                threshold=threshold_dict,
+            )
+        except TypeError:
+            predictions = self.wakeword_model.predict(audio_np)
         score = float(predictions.get(self.wake_model_key, 0.0))
 
         now = time.monotonic()

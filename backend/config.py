@@ -94,7 +94,7 @@ class Settings(BaseSettings):
         description="Identifier of openWakeWord wake model",
     )
     WAKE_WORD_THRESHOLD: float = Field(
-        default=0.6,
+        default=0.7,
         description="Confidence threshold for wake word activation",
     )
     WAKE_WORD_COOLDOWN_SECONDS: float = Field(

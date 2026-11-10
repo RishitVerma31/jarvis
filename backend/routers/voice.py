@@ -33,6 +33,7 @@ SILENCE_TIMEOUT_SECONDS = 1.2
 MAX_RECORDING_SECONDS = 15.0
 INITIAL_SPEECH_TIMEOUT_SECONDS = 4.0
 FOLLOW_UP_TIMEOUT_SECONDS = 5.0
+STANDBY_COOLDOWN_SECONDS = 1.0
 
 # Singleton voice WebSocket session management
 _active_session_lock = asyncio.Lock()
@@ -70,6 +71,7 @@ async def handle_voice_websocket(websocket: WebSocket) -> None:
     follow_up_deadline: float | None = None
     last_acknowledged_turn_id: int | None = None
     voice_service: Any = None
+    standby_cooldown_until: float = 0.0
 
     # Buffers (strictly in-memory bytearrays; no recordings stored on disk)
     wake_buffer = bytearray()
@@ -95,18 +97,19 @@ async def handle_voice_websocket(websocket: WebSocket) -> None:
         follow_up_task = None
 
     def _clear_follow_up() -> None:
-        nonlocal follow_up_active, follow_up_deadline, follow_up_speech_frames
+        nonlocal follow_up_active, follow_up_deadline, follow_up_speech_frames, standby_cooldown_until
         _cancel_follow_up_timer()
         follow_up_active = False
         follow_up_deadline = None
         follow_up_speech_frames = 0
+        standby_cooldown_until = time.monotonic() + STANDBY_COOLDOWN_SECONDS
 
     def _schedule_follow_up_timer(turn_id: int, delay_seconds: float) -> None:
         nonlocal follow_up_task
         _cancel_follow_up_timer()
 
         async def _timer_runner() -> None:
-            nonlocal current_state, follow_up_active, follow_up_deadline, follow_up_speech_frames
+            nonlocal current_state, follow_up_active, follow_up_deadline, follow_up_speech_frames, standby_cooldown_until
             try:
                 while True:
                     now = time.monotonic()
@@ -130,6 +133,7 @@ async def handle_voice_websocket(websocket: WebSocket) -> None:
                     speech_buffer.clear()
                     speech_only_buffer.clear()
                     vad_buffer.clear()
+                    standby_cooldown_until = time.monotonic() + STANDBY_COOLDOWN_SECONDS
                     voice_service.reset_wake_word()
                     await websocket.send_json({
                         "type": "state_change",
@@ -214,6 +218,7 @@ async def handle_voice_websocket(websocket: WebSocket) -> None:
                 speech_buffer.clear()
                 speech_only_buffer.clear()
                 vad_buffer.clear()
+                standby_cooldown_until = time.monotonic() + STANDBY_COOLDOWN_SECONDS
                 voice_service.reset_wake_word()
                 current_state = "WAKE_LISTENING"
                 await websocket.send_json({
@@ -607,6 +612,11 @@ async def handle_voice_websocket(websocket: WebSocket) -> None:
 
                     else:
                         # 2. Wake-word detection (runs ONLY in genuine Standby, NOT during follow-up)
+                        # Discard transitional audio arriving during standby refractory cooldown
+                        if time.monotonic() < standby_cooldown_until:
+                            wake_buffer.clear()
+                            continue
+
                         wake_buffer.extend(raw_bytes)
                         # 1,280 samples = 2,560 bytes = 80ms at 16kHz 16-bit mono
                         while len(wake_buffer) >= 2560:
@@ -657,11 +667,6 @@ async def handle_voice_websocket(websocket: WebSocket) -> None:
                             if frame_rms >= 180.0:
                                 speech_frames_count += 1
                                 if speech_frames_count >= 4:
-                                    speech_started = True
-                                    last_speech_time = time.monotonic()
-                            else:
-                                speech_frames_count += 1
-                                if speech_frames_count >= 6:
                                     speech_started = True
                                     last_speech_time = time.monotonic()
 
@@ -722,6 +727,7 @@ async def handle_voice_websocket(websocket: WebSocket) -> None:
                             else:
                                 _clear_follow_up()
                                 wake_buffer.clear()
+                                standby_cooldown_until = time.monotonic() + STANDBY_COOLDOWN_SECONDS
                                 voice_service.reset_wake_word()
                                 current_state = "WAKE_LISTENING"
                                 await websocket.send_json({
@@ -759,6 +765,7 @@ async def handle_voice_websocket(websocket: WebSocket) -> None:
                         speech_only_buffer.clear()
                         vad_buffer.clear()
                         wake_buffer.clear()
+                        standby_cooldown_until = time.monotonic() + STANDBY_COOLDOWN_SECONDS
                         voice_service.reset_wake_word()
                         _clear_follow_up()
                         current_state = "WAKE_LISTENING"

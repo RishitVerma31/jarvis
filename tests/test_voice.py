@@ -765,6 +765,7 @@ def test_voice_websocket_follow_up_window_timeout_returns_to_standby():
     client = TestClient(app)
     with patch("backend.routers.voice.SILENCE_TIMEOUT_SECONDS", 0.05), \
          patch("backend.routers.voice.FOLLOW_UP_TIMEOUT_SECONDS", 0.15), \
+         patch("backend.routers.voice.STANDBY_COOLDOWN_SECONDS", 0.0), \
          patch("backend.routers.voice.get_voice_service", return_value=mock_vs), \
          patch("backend.routers.voice.ChatService.process_chat", new_callable=AsyncMock, return_value=mock_chat_res), \
          patch("backend.routers.voice.get_settings", return_value=Settings(ENABLE_KOKORO_TTS=False)):
@@ -1095,6 +1096,7 @@ def test_voice_websocket_duplicate_acknowledgement_cannot_extend_expired_deadlin
     client = TestClient(app)
     with patch("backend.routers.voice.SILENCE_TIMEOUT_SECONDS", 0.05), \
          patch("backend.routers.voice.FOLLOW_UP_TIMEOUT_SECONDS", 0.15), \
+         patch("backend.routers.voice.STANDBY_COOLDOWN_SECONDS", 0.0), \
          patch("backend.routers.voice.get_voice_service", return_value=mock_vs), \
          patch("backend.routers.voice.ChatService.process_chat", new_callable=AsyncMock, return_value=mock_chat_res), \
          patch("backend.routers.voice.get_settings", return_value=Settings(ENABLE_KOKORO_TTS=False)):
@@ -1408,6 +1410,7 @@ def test_voice_websocket_duplicate_ack_after_expiry_does_not_disrupt_standby_rec
     client = TestClient(app)
     with patch("backend.routers.voice.SILENCE_TIMEOUT_SECONDS", 0.05), \
          patch("backend.routers.voice.FOLLOW_UP_TIMEOUT_SECONDS", 0.15), \
+         patch("backend.routers.voice.STANDBY_COOLDOWN_SECONDS", 0.0), \
          patch("backend.routers.voice.get_voice_service", return_value=mock_vs), \
          patch("backend.routers.voice.ChatService.process_chat", new_callable=AsyncMock, return_value=mock_chat_res), \
          patch("backend.routers.voice.get_settings", return_value=Settings(ENABLE_KOKORO_TTS=False)):
@@ -1887,4 +1890,43 @@ def test_voice_websocket_initial_send_failure_releases_session_reservation():
         init = ws.receive_json()
         assert init["state"] == "WAKE_LISTENING"
         assert init["turn_id"] == 0
+
+
+def test_voice_websocket_standby_cooldown_suppresses_transitional_audio():
+    """Verify audio sent during standby cooldown is suppressed, and wakes normally after cooldown."""
+    mock_vs, mock_chat_res = _get_mock_voice_services()
+    client = TestClient(app)
+    with patch("backend.routers.voice.SILENCE_TIMEOUT_SECONDS", 0.05), \
+         patch("backend.routers.voice.FOLLOW_UP_TIMEOUT_SECONDS", 0.1), \
+         patch("backend.routers.voice.STANDBY_COOLDOWN_SECONDS", 0.2), \
+         patch("backend.routers.voice.get_voice_service", return_value=mock_vs), \
+         patch("backend.routers.voice.ChatService.process_chat", new_callable=AsyncMock, return_value=mock_chat_res), \
+         patch("backend.routers.voice.get_settings", return_value=Settings(ENABLE_KOKORO_TTS=False)):
+        with client.websocket_connect(f"/ws/voice?ticket={get_test_ws_ticket()}") as ws:
+            ws.receive_json()
+            chat_res, _ = _simulate_voice_turn(ws)
+            turn_1 = chat_res["turn_id"]
+
+            # Arms follow-up (0.1s)
+            ws.send_json({"type": "tts_completed", "turn_id": turn_1})
+            assert ws.receive_json()["follow_up"] is True
+
+            # Wait for follow-up expiration (0.1s)
+            time.sleep(0.12)
+            expired = ws.receive_json()
+            assert expired["follow_up"] is False
+
+            # In standby cooldown (0.2s duration): send wake audio immediately
+            # It must be suppressed and not trigger wake_detected
+            ws.send_bytes(bytes(2560))
+            time.sleep(0.05)
+
+            # Wait out remaining cooldown
+            time.sleep(0.20)
+
+            # Now send wake audio after cooldown has elapsed -> must trigger wake_detected!
+            ws.send_bytes(bytes(2560))
+            wake_event = ws.receive_json()
+            assert wake_event["type"] == "wake_detected"
+            assert ws.receive_json()["state"] == "RECORDING"
 
