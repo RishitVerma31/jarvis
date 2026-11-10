@@ -1,4 +1,5 @@
 import { create } from 'zustand';
+import type { VoiceState, VoiceMetrics } from '../types/voice';
 
 interface UIState {
   // Currently selected session ID (or null for a brand new chat)
@@ -27,6 +28,23 @@ interface UIState {
   setVoiceMuted: (muted: boolean) => void;
   toggleVoiceMuted: () => void;
 
+  // Voice Live Pipeline Activity & Telemetry
+  voiceState: VoiceState;
+  setVoiceState: (state: VoiceState) => void;
+  voiceStatusMessage: string;
+  setVoiceStatusMessage: (msg: string) => void;
+  voiceTranscript: string | null;
+  setVoiceTranscript: (transcript: string | null) => void;
+  voiceAudioLevel: number;
+  setVoiceAudioLevel: (level: number) => void;
+  voiceLastMetrics: VoiceMetrics | null;
+  setVoiceLastMetrics: (metrics: VoiceMetrics | null) => void;
+  voiceIsFollowUp: boolean;
+  setVoiceIsFollowUp: (followUp: boolean) => void;
+  onEmergencyStop?: () => void;
+  setOnEmergencyStop: (fn: (() => void) | undefined) => void;
+  triggerEmergencyStop: () => void;
+
   // Security & Passkey Authentication (Stage B)
   isAuthModalOpen: boolean;
   setAuthModalOpen: (open: boolean) => void;
@@ -34,7 +52,7 @@ interface UIState {
   setAuthenticated: (authenticated: boolean) => void;
 }
 
-export const useUIStore = create<UIState>((set) => ({
+export const useUIStore = create<UIState>((set, get) => ({
   activeSessionId: null,
   setActiveSessionId: (id) => set({ activeSessionId: id }),
 
@@ -55,6 +73,25 @@ export const useUIStore = create<UIState>((set) => ({
   isVoiceMuted: false,
   setVoiceMuted: (muted) => set({ isVoiceMuted: muted }),
   toggleVoiceMuted: () => set((state) => ({ isVoiceMuted: !state.isVoiceMuted })),
+
+  voiceState: 'STANDBY',
+  setVoiceState: (state) => set({ voiceState: state }),
+  voiceStatusMessage: 'Voice Assistant offline',
+  setVoiceStatusMessage: (msg) => set({ voiceStatusMessage: msg }),
+  voiceTranscript: null,
+  setVoiceTranscript: (transcript) => set({ voiceTranscript: transcript }),
+  voiceAudioLevel: 0,
+  setVoiceAudioLevel: (level) => set({ voiceAudioLevel: level }),
+  voiceLastMetrics: null,
+  setVoiceLastMetrics: (metrics) => set({ voiceLastMetrics: metrics }),
+  voiceIsFollowUp: false,
+  setVoiceIsFollowUp: (followUp) => set({ voiceIsFollowUp: followUp }),
+  onEmergencyStop: undefined,
+  setOnEmergencyStop: (fn) => set({ onEmergencyStop: fn }),
+  triggerEmergencyStop: () => {
+    const fn = get().onEmergencyStop;
+    if (fn) fn();
+  },
 
   isAuthModalOpen: false,
   setAuthModalOpen: (open) => set({ isAuthModalOpen: open }),

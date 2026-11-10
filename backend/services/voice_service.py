@@ -139,7 +139,7 @@ def validate_audio_recording(
     pcm_bytes: bytes,
     speech_frames: int,
     min_speech_frames: int = 4,
-    min_rms: float = 180.0,
+    min_rms: float = 100.0,
     speech_pcm_bytes: bytes | None = None,
 ) -> tuple[bool, str]:
     """Validate recorded audio before passing to STT and LLM.
@@ -148,7 +148,7 @@ def validate_audio_recording(
         pcm_bytes: Complete recorded PCM byte sequence (including trailing silence).
         speech_frames: Number of 30ms frames classified as speech by VAD.
         min_speech_frames: Minimum number of speech frames required (default: 4 frames = 120ms).
-        min_rms: Minimum RMS energy threshold required for active speech (default: 180.0).
+        min_rms: Minimum RMS energy threshold required for active speech (default: 100.0).
         speech_pcm_bytes: Optional byte sequence containing only the identified speech frames.
             If omitted or empty, speech frames are extracted using WebRTC VAD from pcm_bytes.
 
@@ -257,7 +257,6 @@ class VoiceService:
             wakeword_models=[str(hey_jarvis_path)],
             melspec_model_path=str(melspec_path),
             embedding_model_path=str(embedding_path),
-            vad_threshold=0.5,
             inference_framework="onnx",
         )
         keys = list(self.wakeword_model.models.keys())
@@ -328,16 +327,7 @@ class VoiceService:
             return False, 0.0
 
         audio_np = np.frombuffer(pcm_chunk, dtype=np.int16)
-        patience_dict = {self.wake_model_key: 2} if hasattr(self, "wake_model_key") and self.wake_model_key else {}
-        threshold_dict = {self.wake_model_key: self.threshold} if hasattr(self, "wake_model_key") and self.wake_model_key else {}
-        try:
-            predictions = self.wakeword_model.predict(
-                audio_np,
-                patience=patience_dict,
-                threshold=threshold_dict,
-            )
-        except TypeError:
-            predictions = self.wakeword_model.predict(audio_np)
+        predictions = self.wakeword_model.predict(audio_np)
         score = float(predictions.get(self.wake_model_key, 0.0))
 
         now = time.monotonic()

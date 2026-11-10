@@ -3,6 +3,7 @@ import { Shield, Cpu, Activity, Database } from 'lucide-react';
 import type { ChatMessage } from '../../hooks/useChat';
 import { MessageBubble } from './MessageBubble';
 import { useHealth } from '../../hooks/useHealth';
+import { VoiceActivityHUD } from '../voice/VoiceActivityHUD';
 
 interface ChatContainerProps {
   messages: ChatMessage[];
@@ -58,6 +59,10 @@ export const ChatContainer: React.FC<ChatContainerProps> = ({
       <div className="flex-1 overflow-y-auto p-3 sm:p-4 md:p-6 flex flex-col items-center justify-center relative select-none">
         {/* Subtle Background Radial Energy Field */}
         <div className="absolute inset-0 bg-[radial-gradient(ellipse_at_center,rgba(6,182,212,0.08)_0%,transparent_70%)] pointer-events-none" />
+
+        <div className="w-full max-w-2xl px-2 z-20">
+          <VoiceActivityHUD />
+        </div>
 
         <div className="max-w-2xl w-full text-center space-y-5 sm:space-y-7 relative z-10 py-4">
           {/* Holographic Arc Reactor Core with Multi-Ring Rotation */}
@@ -168,6 +173,7 @@ export const ChatContainer: React.FC<ChatContainerProps> = ({
   return (
     <div className="flex-1 overflow-y-auto p-3 sm:p-4 md:p-6 space-y-4 sm:space-y-5">
       <div className="max-w-3xl mx-auto space-y-4 sm:space-y-5">
+        <VoiceActivityHUD />
         {messages.map((message) => (
           <MessageBubble key={message.id} message={message} />
         ))}

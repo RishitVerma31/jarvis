@@ -574,7 +574,7 @@ async def handle_voice_websocket(websocket: WebSocket) -> None:
                             is_speech = voice_service.is_speech_frame(vad_frame)
                             frame_rms = compute_pcm_rms(vad_frame)
 
-                            if is_speech and frame_rms >= 180.0:
+                            if is_speech and frame_rms >= 100.0:
                                 follow_up_speech_frames += 1
                                 captured_follow_up_frames.extend(vad_frame)
                                 if follow_up_speech_frames >= 2:
@@ -664,7 +664,9 @@ async def handle_voice_websocket(websocket: WebSocket) -> None:
                         if voice_service.is_speech_frame(vad_frame):
                             speech_only_buffer.extend(vad_frame)
                             frame_rms = compute_pcm_rms(vad_frame)
-                            if frame_rms >= 180.0:
+                            elapsed_recording = time.monotonic() - record_start_time
+                            # 300ms post-wake grace period ignores acoustic tail of "Hey Jarvis" / chime
+                            if elapsed_recording >= 0.30 and frame_rms >= 100.0:
                                 speech_frames_count += 1
                                 if speech_frames_count >= 4:
                                     speech_started = True
@@ -699,7 +701,7 @@ async def handle_voice_websocket(websocket: WebSocket) -> None:
                             audio_to_transcribe,
                             recorded_frames_count,
                             min_speech_frames=4,
-                            min_rms=180.0,
+                            min_rms=100.0,
                             speech_pcm_bytes=speech_bytes,
                         )
 

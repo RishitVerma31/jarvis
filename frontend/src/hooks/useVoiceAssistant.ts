@@ -70,6 +70,13 @@ export function useVoiceAssistant() {
     setVoiceModeActive,
     isVoiceMuted,
     setVoiceMuted,
+    setVoiceState: setStoreVoiceState,
+    setVoiceStatusMessage: setStoreStatusMessage,
+    setVoiceTranscript: setStoreTranscript,
+    setVoiceAudioLevel: setStoreAudioLevel,
+    setVoiceLastMetrics: setStoreLastMetrics,
+    setVoiceIsFollowUp: setStoreIsFollowUp,
+    setOnEmergencyStop,
   } = useUIStore();
 
   const [voiceState, setVoiceState] = useState<VoiceState>('STANDBY');
@@ -78,6 +85,21 @@ export function useVoiceAssistant() {
   const [lastMetrics, setLastMetrics] = useState<VoiceMetrics | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [isFollowUp, setIsFollowUp] = useState<boolean>(false);
+
+  const updateVoiceState = useCallback((state: VoiceState) => {
+    setVoiceState(state);
+    setStoreVoiceState(state);
+  }, [setStoreVoiceState]);
+
+  const updateStatusMessage = useCallback((msg: string) => {
+    setStatusMessage(msg);
+    setStoreStatusMessage(msg);
+  }, [setStoreStatusMessage]);
+
+  const updateIsFollowUp = useCallback((followUp: boolean) => {
+    setIsFollowUp(followUp);
+    setStoreIsFollowUp(followUp);
+  }, [setStoreIsFollowUp]);
 
   const voiceSocketRef = useRef<VoiceSocket | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
@@ -162,23 +184,30 @@ export function useVoiceAssistant() {
 
   const handleStopSpeaking = useCallback(() => {
     cancelAllSpeech();
-    setIsFollowUp(false);
+    updateIsFollowUp(false);
     if (voiceSocketRef.current?.isConnected()) {
       voiceSocketRef.current.sendMessage({ type: 'stop_speaking' });
     }
-    setVoiceState('WAKE_LISTENING');
-    setStatusMessage('Standing by. Listening for "Hey Jarvis".');
-  }, [cancelAllSpeech]);
+    updateVoiceState('WAKE_LISTENING');
+    updateStatusMessage('Standing by. Listening for "Hey Jarvis".');
+    setStoreTranscript(null);
+  }, [cancelAllSpeech, updateIsFollowUp, updateVoiceState, updateStatusMessage, setStoreTranscript]);
 
   const emergencyStop = useCallback(() => {
     cancelAllSpeech();
-    setIsFollowUp(false);
+    updateIsFollowUp(false);
     if (voiceSocketRef.current?.isConnected()) {
       voiceSocketRef.current.sendMessage({ type: 'emergency_stop' });
     }
-    setVoiceState('WAKE_LISTENING');
-    setStatusMessage('Emergency stop triggered. Standing by.');
-  }, [cancelAllSpeech]);
+    updateVoiceState('WAKE_LISTENING');
+    updateStatusMessage('Emergency stop triggered. Standing by.');
+    setStoreTranscript(null);
+  }, [cancelAllSpeech, updateIsFollowUp, updateVoiceState, updateStatusMessage, setStoreTranscript]);
+
+  useEffect(() => {
+    setOnEmergencyStop(emergencyStop);
+    return () => setOnEmergencyStop(undefined);
+  }, [emergencyStop, setOnEmergencyStop]);
 
   const handleUnlockAudio = useCallback(() => {
     try {
@@ -290,11 +319,16 @@ export function useVoiceAssistant() {
           }
 
           // 3. Mutate React UI state (only reached if event passed validation)
-          setVoiceState(event.state);
+          updateVoiceState(event.state);
           if (event.message) {
-            setStatusMessage(event.message);
+            updateStatusMessage(event.message);
           }
-          setIsFollowUp(Boolean(event.follow_up));
+          updateIsFollowUp(Boolean(event.follow_up));
+          if (event.state === 'WAKE_LISTENING' && !event.follow_up) {
+            setStoreTranscript(null);
+          } else if (event.state === 'RECORDING') {
+            setStoreTranscript(null);
+          }
 
           // 4. States where microphone PCM streaming MUST remain active: WAKE_LISTENING, RECORDING
           if (event.state === 'WAKE_LISTENING' || event.state === 'RECORDING') {
@@ -379,21 +413,24 @@ export function useVoiceAssistant() {
         }
 
         case 'wake_detected':
-          setIsFollowUp(false);
-          setVoiceState('WAKE_DETECTED');
-          setStatusMessage(`"Hey Jarvis" detected! (${Math.round(event.score * 100)}% match)`);
+          updateIsFollowUp(false);
+          updateVoiceState('WAKE_DETECTED');
+          updateStatusMessage(`"Hey Jarvis" detected! (${Math.round(event.score * 100)}% match)`);
+          setStoreTranscript(null);
           // Suppress mic streaming during wake chime playback (450ms) to prevent acoustic loopback
           wakeMuteUntilRef.current = Date.now() + 450;
           playJarvisWakeChime();
           break;
 
         case 'transcription':
-          setStatusMessage(`Recognized: "${event.text}"`);
+          updateStatusMessage(`Recognized: "${event.text}"`);
+          setStoreTranscript(event.text);
           break;
 
         case 'chat_response': {
-          setIsFollowUp(false);
-          setVoiceState('SPEAKING');
+          updateIsFollowUp(false);
+          updateVoiceState('SPEAKING');
+          updateStatusMessage('Speaking response...');
           const targetSessionId = event.session_id;
 
           if (!activeSessionIdRef.current) {
@@ -402,6 +439,7 @@ export function useVoiceAssistant() {
 
           if (event.metrics) {
             setLastMetrics(event.metrics);
+            setStoreLastMetrics(event.metrics);
           }
 
           // Hydrate conversation cache immediately
@@ -568,14 +606,17 @@ export function useVoiceAssistant() {
         }
 
         case 'empty_speech':
-          setIsFollowUp(false);
-          setStatusMessage(event.message || 'No speech detected.');
+          updateIsFollowUp(false);
+          updateStatusMessage(event.message || 'No speech detected.');
+          setStoreTranscript(null);
           break;
 
         case 'error':
-          setIsFollowUp(false);
-          setVoiceState('ERROR');
+          updateIsFollowUp(false);
+          updateVoiceState('ERROR');
           setErrorMessage(event.message);
+          updateStatusMessage(event.message || 'Voice processing error.');
+          setStoreTranscript(null);
           cancelAllSpeech();
           break;
       }
@@ -619,7 +660,8 @@ export function useVoiceAssistant() {
     }
 
     setAudioLevel(0);
-  }, []);
+    setStoreAudioLevel(0);
+  }, [setStoreAudioLevel]);
 
   // Setup microphone and streaming (guarded against multiple concurrent instances)
   const startAudioCapture = useCallback(async () => {
@@ -674,6 +716,7 @@ export function useVoiceAssistant() {
           Date.now() < wakeMuteUntilRef.current
         ) {
           setAudioLevel(0);
+          setStoreAudioLevel(0);
           return;
         }
 
@@ -685,7 +728,9 @@ export function useVoiceAssistant() {
           sumSquares += inputData[i] * inputData[i];
         }
         const rms = Math.sqrt(sumSquares / inputData.length);
-        setAudioLevel(Math.min(1.0, rms * 6.0));
+        const calculatedLevel = Math.min(1.0, rms * 6.0);
+        setAudioLevel(calculatedLevel);
+        setStoreAudioLevel(calculatedLevel);
 
         // Resample and send to WebSocket
         const pcm16 = resampleTo16kPCM(inputData, audioCtx.sampleRate);

@@ -623,7 +623,7 @@ def test_audio_validation_helpers():
     assert not validate_audio_recording(silence, 5)[0]  # duration too short
     long_silence = bytes(960 * 10)  # 300ms of zeros
     assert not validate_audio_recording(long_silence, 0)[0]  # insufficient speech frames
-    assert not validate_audio_recording(long_silence, 5)[0]  # RMS is 0.0 < 180.0
+    assert not validate_audio_recording(long_silence, 5)[0]  # RMS is 0.0 < 100.0
 
     speech_pcm = _make_speech_frame(rms=500.0) * 5
     assert validate_audio_recording(speech_pcm, 5)[0]

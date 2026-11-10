@@ -141,6 +141,11 @@ export const VoiceControls: React.FC = () => {
           {/* Current State Badge */}
           {getStateBadge()}
 
+          {/* Live Status Message (prominently visible in header on md+ screens) */}
+          <span className="hidden md:inline-block text-xs font-mono text-cyan-200/90 max-w-[200px] lg:max-w-[300px] truncate pl-1 border-l border-cyan-500/20">
+            {statusMessage}
+          </span>
+
           {/* Voice Speaker Test Button (Touch-friendly voice test on iOS Safari) */}
           <button
             type="button"
