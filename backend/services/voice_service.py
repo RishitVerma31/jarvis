@@ -348,6 +348,7 @@ class VoiceService:
         previously triggered wake phrase or transient noise cannot cause
         phantom duplicate wake events upon entering standby.
         """
+        self.last_wake_time = time.monotonic()
         try:
             if hasattr(self, "wakeword_model") and self.wakeword_model is not None:
                 self.wakeword_model.reset()

@@ -1571,8 +1571,11 @@ def test_voice_service_reset_wake_word_clears_model():
         vs = VoiceService()
         vs.reset_wake_word()
         mock_model.reset.assert_called_once()
+        assert vs.last_wake_time > 0.0
 
         mock_model.reset.reset_mock()
+        # Simulate cooldown elapsed so next wake word can be detected
+        vs.last_wake_time = 0.0
         # When wake word is detected, predict_wake_word must automatically invoke reset_wake_word()
         detected, score = vs.predict_wake_word(silence_80ms)
         assert detected is True

@@ -90,6 +90,7 @@ export function useVoiceAssistant() {
   const ackTimeoutTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const activeAudioPlaybackStopRef = useRef<(() => void) | null>(null);
   const currentTurnIdRef = useRef<number>(0);
+  const playbackGenerationRef = useRef<number>(0);
   const settledTurnIdRef = useRef<number | null>(null);
   const retryCountPerTurnRef = useRef<Map<number, number>>(new Map());
   const hasInitializedStartupRef = useRef<boolean>(false);
@@ -127,7 +128,7 @@ export function useVoiceAssistant() {
 
   // Stop all active Kokoro audio playback and browser speech synthesis cleanly
   const cancelAllSpeech = useCallback(() => {
-    currentTurnIdRef.current++;
+    playbackGenerationRef.current++;
     settledTurnIdRef.current = null;
     retryCountPerTurnRef.current.clear();
 
@@ -443,6 +444,7 @@ export function useVoiceAssistant() {
           cancelAllSpeech();
           const turnId = event.turn_id ?? currentTurnIdRef.current;
           currentTurnIdRef.current = turnId;
+          const currentPlaybackGen = playbackGenerationRef.current;
 
           // Mute hardware microphone track before starting speech to release acoustic loopback
           if (mediaStreamRef.current) {
@@ -455,7 +457,7 @@ export function useVoiceAssistant() {
           // Speak reply with acoustic loopback prevention and single-dispatch guard
           let ttsCompletedDispatched = false;
           const sendTTSCompleted = () => {
-            if (currentTurnIdRef.current !== turnId) return;
+            if (playbackGenerationRef.current !== currentPlaybackGen || currentTurnIdRef.current !== turnId) return;
             if (ttsCompletedDispatched) return;
             ttsCompletedDispatched = true;
             settledTurnIdRef.current = turnId;
@@ -485,12 +487,12 @@ export function useVoiceAssistant() {
 
           // 300ms acoustic echo suppression buffer delay
           const scheduleTTSCompletion = () => {
-            if (currentTurnIdRef.current !== turnId) return;
+            if (playbackGenerationRef.current !== currentPlaybackGen || currentTurnIdRef.current !== turnId) return;
             if (echoBufferTimerRef.current) {
               clearTimeout(echoBufferTimerRef.current);
             }
             echoBufferTimerRef.current = setTimeout(() => {
-              if (currentTurnIdRef.current !== turnId) return;
+              if (playbackGenerationRef.current !== currentPlaybackGen || currentTurnIdRef.current !== turnId) return;
               echoBufferTimerRef.current = null;
               sendTTSCompleted();
             }, 300);
@@ -498,14 +500,14 @@ export function useVoiceAssistant() {
 
           // Fallback to browser SpeechSynthesis if Kokoro audio fails or is absent
           const fallbackToSpeechSynthesis = (reason?: unknown) => {
-            if (currentTurnIdRef.current !== turnId) return;
+            if (playbackGenerationRef.current !== currentPlaybackGen || currentTurnIdRef.current !== turnId) return;
             console.warn('[VoiceAssistant] Kokoro playback failed, falling back to browser SpeechSynthesis:', reason);
             activeAudioPlaybackStopRef.current = null;
             try {
               speak(
                 event.reply,
                 () => {
-                  if (currentTurnIdRef.current !== turnId) return;
+                  if (playbackGenerationRef.current !== currentPlaybackGen || currentTurnIdRef.current !== turnId) return;
                   isStreamingPausedRef.current = true;
                 },
                 () => {
@@ -524,11 +526,11 @@ export function useVoiceAssistant() {
               const cancelAudio = playBase64WavAudio(
                 event.audio,
                 () => {
-                  if (currentTurnIdRef.current !== turnId) return;
+                  if (playbackGenerationRef.current !== currentPlaybackGen || currentTurnIdRef.current !== turnId) return;
                   isStreamingPausedRef.current = true;
                 },
                 () => {
-                  if (currentTurnIdRef.current !== turnId) return;
+                  if (playbackGenerationRef.current !== currentPlaybackGen || currentTurnIdRef.current !== turnId) return;
                   activeAudioPlaybackStopRef.current = null;
                   scheduleTTSCompletion();
                 },
@@ -550,7 +552,7 @@ export function useVoiceAssistant() {
             speak(
               event.reply,
               () => {
-                if (currentTurnIdRef.current !== turnId) return;
+                if (playbackGenerationRef.current !== currentPlaybackGen || currentTurnIdRef.current !== turnId) return;
                 isStreamingPausedRef.current = true;
               },
               () => {
@@ -655,6 +657,11 @@ export function useVoiceAssistant() {
       scriptProcessorRef.current = processor;
 
       processor.onaudioprocess = (e) => {
+        // Zero out outputBuffer to ensure no microphone audio is routed to speakers
+        for (let ch = 0; ch < e.outputBuffer.numberOfChannels; ch++) {
+          e.outputBuffer.getChannelData(ch).fill(0);
+        }
+
         if (!isVoiceModeActiveRef.current || isVoiceMutedRef.current || isStreamingPausedRef.current) {
           setAudioLevel(0);
           return;
@@ -675,8 +682,12 @@ export function useVoiceAssistant() {
         voiceSocketRef.current?.sendAudio(pcm16);
       };
 
+      // Mute gain node strictly prevents acoustic feedback loop from microphone to system speakers
+      const muteGain = audioCtx.createGain();
+      muteGain.gain.setValueAtTime(0, audioCtx.currentTime);
       source.connect(processor);
-      processor.connect(audioCtx.destination);
+      processor.connect(muteGain);
+      muteGain.connect(audioCtx.destination);
     } catch (err) {
       isCapturingRef.current = false;
       console.error('[VoiceAssistant] Microphone access denied or failed:', err);

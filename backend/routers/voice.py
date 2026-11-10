@@ -656,12 +656,12 @@ async def handle_voice_websocket(websocket: WebSocket) -> None:
                             frame_rms = compute_pcm_rms(vad_frame)
                             if frame_rms >= 180.0:
                                 speech_frames_count += 1
-                                if speech_frames_count >= 2:
+                                if speech_frames_count >= 4:
                                     speech_started = True
                                     last_speech_time = time.monotonic()
                             else:
                                 speech_frames_count += 1
-                                if speech_frames_count >= 3:
+                                if speech_frames_count >= 6:
                                     speech_started = True
                                     last_speech_time = time.monotonic()
 
