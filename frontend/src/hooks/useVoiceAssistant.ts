@@ -247,25 +247,22 @@ export function useVoiceAssistant() {
             setStatusMessage(event.message);
           }
 
-          // Immediately pause PCM transmission when recording ends and processing begins
-          if (event.state === 'TRANSCRIBING' || event.state === 'PROCESSING') {
-            isStreamingPausedRef.current = true;
-          }
+          // 1. States where microphone PCM streaming MUST remain active: WAKE_LISTENING, RECORDING
+          if (event.state === 'WAKE_LISTENING' || event.state === 'RECORDING') {
+            if (event.state === 'WAKE_LISTENING') {
+              // Guard against stale turn acknowledgements
+              if (
+                event.turn_id !== undefined &&
+                event.turn_id !== currentTurnIdRef.current
+              ) {
+                break;
+              }
 
-          // Acknowledged standby transition: restore audio session, mic tracks, and unpause streaming
-          if (event.state === 'WAKE_LISTENING') {
-            // Guard against stale turn acknowledgements
-            if (
-              event.turn_id !== undefined &&
-              event.turn_id !== currentTurnIdRef.current
-            ) {
-              break;
-            }
-
-            // Clear any pending ack timeout timer
-            if (ackTimeoutTimerRef.current) {
-              clearTimeout(ackTimeoutTimerRef.current);
-              ackTimeoutTimerRef.current = null;
+              // Clear any pending ack timeout timer
+              if (ackTimeoutTimerRef.current) {
+                clearTimeout(ackTimeoutTimerRef.current);
+                ackTimeoutTimerRef.current = null;
+              }
             }
 
             // Restore iOS audio session to play-and-record for voice input
@@ -278,22 +275,27 @@ export function useVoiceAssistant() {
               });
             }
 
-            // Resume PCM streaming to WebSocket
+            // Resume/keep PCM streaming active to WebSocket
             isStreamingPausedRef.current = false;
-          } else {
-            // If backend reports any non-standby state (SPEAKING, PROCESSING, TRANSCRIBING, MUTED),
-            // ensure microphone remains muted and PCM streaming remains paused!
+
+          // 2. States where microphone PCM streaming MUST be paused: TRANSCRIBING, PROCESSING, SPEAKING, MUTED
+          } else if (
+            event.state === 'TRANSCRIBING' ||
+            event.state === 'PROCESSING' ||
+            event.state === 'SPEAKING' ||
+            event.state === 'MUTED'
+          ) {
+            // Mute hardware microphone tracks during speech output or when user-muted to eliminate acoustic loopback
             if (
               mediaStreamRef.current &&
-              (event.state === 'SPEAKING' ||
-                event.state === 'PROCESSING' ||
-                event.state === 'TRANSCRIBING' ||
-                event.state === 'MUTED')
+              (event.state === 'SPEAKING' || event.state === 'MUTED')
             ) {
               mediaStreamRef.current.getAudioTracks().forEach((track) => {
                 track.enabled = false;
               });
             }
+
+            // Pause PCM transmission while backend processes or speaks
             isStreamingPausedRef.current = true;
 
             // Phase 1 Recovery Correction:

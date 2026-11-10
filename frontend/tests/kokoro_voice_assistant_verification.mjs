@@ -616,7 +616,14 @@ describe('Kokoro Voice Assistant Integration (Milestone 2, Step 2)', () => {
       function handleServerEvent(event) {
         if (event.type === 'state_change') {
           voiceState = event.state;
-          if (event.state === 'TRANSCRIBING' || event.state === 'PROCESSING') {
+          if (event.state === 'WAKE_LISTENING' || event.state === 'RECORDING') {
+            isStreamingPaused = false;
+          } else if (
+            event.state === 'TRANSCRIBING' ||
+            event.state === 'PROCESSING' ||
+            event.state === 'SPEAKING' ||
+            event.state === 'MUTED'
+          ) {
             isStreamingPaused = true;
           }
         }
@@ -1242,6 +1249,159 @@ describe('Kokoro Voice Assistant Integration (Milestone 2, Step 2)', () => {
       assert.strictEqual(statusMessage, 'Speech completion unacknowledged. Tap stop or emergency stop to reset.');
       assert.strictEqual(mockStream.getAudioTracks()[0].enabled, false, 'Microphone must remain strictly muted');
       assert.strictEqual(isStreamingPaused, true, 'Streaming must remain strictly paused');
+    });
+  });
+
+  describe('Phase 1 Hotfix: Microphone PCM Streaming & Recording Lifecycle', () => {
+    // Architectural Note:
+    // Node.js native test runner (`node --test`) executes without a React component lifecycle
+    // or bundler module resolver (ERR_MODULE_NOT_FOUND on extensionless imports in useVoiceAssistant.ts).
+    // Direct instantiation of the React hook useVoiceAssistant requires a full React DOM/renderHook
+    // harness not present in this lightweight Node runner.
+    // The tests below model the exact production state-machine dispatch and onaudioprocess gating
+    // logic from useVoiceAssistant.ts, while tsc -b and Vite production build verify complete
+    // type, interface, and syntactic integrity of the hook itself.
+
+    function createVoiceHarness() {
+      const state = {
+        voiceState: 'STANDBY',
+        isVoiceModeActive: true,
+        isVoiceMuted: false,
+        isStreamingPaused: false,
+        micTracks: [{ enabled: true }],
+        sentAudioPackets: [],
+      };
+
+      const handleServerEvent = (event) => {
+        if (event.type === 'state_change') {
+          state.voiceState = event.state;
+
+          // 1. States where microphone PCM streaming MUST remain active: WAKE_LISTENING, RECORDING
+          if (event.state === 'WAKE_LISTENING' || event.state === 'RECORDING') {
+            state.micTracks.forEach((track) => {
+              track.enabled = true;
+            });
+            state.isStreamingPaused = false;
+
+          // 2. States where microphone PCM streaming MUST be paused: TRANSCRIBING, PROCESSING, SPEAKING, MUTED
+          } else if (
+            event.state === 'TRANSCRIBING' ||
+            event.state === 'PROCESSING' ||
+            event.state === 'SPEAKING' ||
+            event.state === 'MUTED'
+          ) {
+            if (event.state === 'SPEAKING' || event.state === 'MUTED') {
+              state.micTracks.forEach((track) => {
+                track.enabled = false;
+              });
+            }
+            state.isStreamingPaused = true;
+          }
+        }
+      };
+
+      // Simulates ScriptProcessorNode.onaudioprocess gating from useVoiceAssistant.ts
+      const processAudioFrame = (pcmChunk) => {
+        if (!state.isVoiceModeActive || state.isVoiceMuted || state.isStreamingPaused) {
+          return false; // dropped
+        }
+        state.sentAudioPackets.push(pcmChunk);
+        return true; // sent to WebSocket
+      };
+
+      return { state, handleServerEvent, processAudioFrame };
+    }
+
+    it('1. WAKE_LISTENING keeps PCM streaming active', () => {
+      const { state, handleServerEvent, processAudioFrame } = createVoiceHarness();
+      handleServerEvent({ type: 'state_change', state: 'WAKE_LISTENING' });
+
+      assert.strictEqual(state.isStreamingPaused, false, 'PCM streaming must be active during WAKE_LISTENING');
+      assert.strictEqual(state.micTracks[0].enabled, true, 'Microphone track must be enabled');
+      assert.strictEqual(processAudioFrame(new Int16Array(1280)), true, 'Audio frames must be transmitted to WebSocket');
+      assert.strictEqual(state.sentAudioPackets.length, 1);
+    });
+
+    it('2. RECORDING keeps PCM streaming active', () => {
+      const { state, handleServerEvent, processAudioFrame } = createVoiceHarness();
+      handleServerEvent({ type: 'state_change', state: 'RECORDING' });
+
+      assert.strictEqual(state.isStreamingPaused, false, 'PCM streaming must be active during RECORDING');
+      assert.strictEqual(state.micTracks[0].enabled, true, 'Microphone track must be enabled');
+      assert.strictEqual(processAudioFrame(new Int16Array(960)), true, 'Audio frames must be transmitted to WebSocket');
+      assert.strictEqual(state.sentAudioPackets.length, 1);
+    });
+
+    it('3. Transition from WAKE_LISTENING to RECORDING does not pause PCM streaming', () => {
+      const { state, handleServerEvent, processAudioFrame } = createVoiceHarness();
+
+      // In standby
+      handleServerEvent({ type: 'state_change', state: 'WAKE_LISTENING' });
+      assert.strictEqual(state.isStreamingPaused, false);
+      assert.strictEqual(processAudioFrame(new Int16Array(1280)), true);
+
+      // Wake word detected -> backend transitions to RECORDING
+      handleServerEvent({ type: 'state_change', state: 'RECORDING' });
+      assert.strictEqual(state.isStreamingPaused, false, 'Transition to RECORDING must NOT pause streaming');
+      assert.strictEqual(processAudioFrame(new Int16Array(960)), true, 'Audio frames must continue sending uninterrupted');
+      assert.strictEqual(state.sentAudioPackets.length, 2);
+    });
+
+    it('4. Microphone tracks remain enabled during RECORDING', () => {
+      const { state, handleServerEvent } = createVoiceHarness();
+      handleServerEvent({ type: 'state_change', state: 'RECORDING' });
+
+      assert.strictEqual(state.micTracks[0].enabled, true, 'Microphone track must remain enabled during RECORDING');
+    });
+
+    it('5. TRANSCRIBING pauses PCM streaming', () => {
+      const { state, handleServerEvent, processAudioFrame } = createVoiceHarness();
+      handleServerEvent({ type: 'state_change', state: 'RECORDING' });
+      assert.strictEqual(state.isStreamingPaused, false);
+
+      handleServerEvent({ type: 'state_change', state: 'TRANSCRIBING' });
+      assert.strictEqual(state.isStreamingPaused, true, 'PCM streaming must pause during TRANSCRIBING');
+      assert.strictEqual(processAudioFrame(new Int16Array(960)), false, 'Audio frames must be dropped during TRANSCRIBING');
+      assert.strictEqual(state.sentAudioPackets.length, 0);
+    });
+
+    it('6. PROCESSING pauses PCM streaming', () => {
+      const { state, handleServerEvent, processAudioFrame } = createVoiceHarness();
+      handleServerEvent({ type: 'state_change', state: 'PROCESSING' });
+
+      assert.strictEqual(state.isStreamingPaused, true, 'PCM streaming must pause during PROCESSING');
+      assert.strictEqual(processAudioFrame(new Int16Array(960)), false, 'Audio frames must be dropped during PROCESSING');
+    });
+
+    it('7. SPEAKING and MUTED retain their existing microphone suppression behavior', () => {
+      const { state, handleServerEvent, processAudioFrame } = createVoiceHarness();
+
+      // In SPEAKING: both streaming paused AND hardware tracks disabled
+      handleServerEvent({ type: 'state_change', state: 'SPEAKING' });
+      assert.strictEqual(state.isStreamingPaused, true, 'Streaming must pause during SPEAKING');
+      assert.strictEqual(state.micTracks[0].enabled, false, 'Hardware mic track must be disabled during SPEAKING');
+      assert.strictEqual(processAudioFrame(new Int16Array(960)), false);
+
+      // In MUTED: both streaming paused AND hardware tracks disabled
+      handleServerEvent({ type: 'state_change', state: 'MUTED' });
+      assert.strictEqual(state.isStreamingPaused, true, 'Streaming must pause during MUTED');
+      assert.strictEqual(state.micTracks[0].enabled, false, 'Hardware mic track must be disabled during MUTED');
+      assert.strictEqual(processAudioFrame(new Int16Array(960)), false);
+    });
+
+    it('8. Transition from RECORDING to TRANSCRIBING correctly pauses streaming', () => {
+      const { state, handleServerEvent, processAudioFrame } = createVoiceHarness();
+
+      // Active recording: speech frames streaming to backend
+      handleServerEvent({ type: 'state_change', state: 'RECORDING' });
+      assert.strictEqual(state.isStreamingPaused, false);
+      assert.strictEqual(processAudioFrame(new Int16Array(960)), true, 'Frames stream during RECORDING');
+
+      // VAD detects end-of-speech -> backend transitions to TRANSCRIBING
+      handleServerEvent({ type: 'state_change', state: 'TRANSCRIBING' });
+      assert.strictEqual(state.isStreamingPaused, true, 'Streaming must pause upon entering TRANSCRIBING');
+      assert.strictEqual(processAudioFrame(new Int16Array(960)), false, 'Frames must stop streaming upon entering TRANSCRIBING');
+      assert.strictEqual(state.sentAudioPackets.length, 1, 'Only the frame from RECORDING should have been sent');
     });
   });
 });
