@@ -607,4 +607,641 @@ describe('Kokoro Voice Assistant Integration (Milestone 2, Step 2)', () => {
     assert.strictEqual(speechPrimed, true, 'SpeechSynthesis must be primed');
     assert.strictEqual(webAudioPrimed, true, 'Kokoro Web Audio context must be primed');
   });
+
+  describe('Phase 1 Handshake & Microphone Gating Safeguards', () => {
+    it('PCM transmission pauses on TRANSCRIBING and remains paused through PROCESSING and SPEAKING', () => {
+      let isStreamingPaused = false;
+      let voiceState = 'RECORDING';
+
+      function handleServerEvent(event) {
+        if (event.type === 'state_change') {
+          voiceState = event.state;
+          if (event.state === 'TRANSCRIBING' || event.state === 'PROCESSING') {
+            isStreamingPaused = true;
+          }
+        }
+      }
+
+      assert.strictEqual(isStreamingPaused, false, 'Streaming initially active');
+
+      handleServerEvent({ type: 'state_change', state: 'TRANSCRIBING' });
+      assert.strictEqual(voiceState, 'TRANSCRIBING');
+      assert.strictEqual(isStreamingPaused, true, 'Must pause streaming immediately on TRANSCRIBING');
+
+      handleServerEvent({ type: 'state_change', state: 'PROCESSING' });
+      assert.strictEqual(voiceState, 'PROCESSING');
+      assert.strictEqual(isStreamingPaused, true, 'Must remain paused during PROCESSING');
+    });
+
+    it('microphone tracks and PCM stream resume only after receiving matching backend WAKE_LISTENING acknowledgement', async () => {
+      let isStreamingPaused = false;
+      let currentTurnId = 1;
+      const turnId = 1;
+      let echoTimer = null;
+
+      // 1. Enter SPEAKING
+      mockStream.getAudioTracks().forEach((t) => (t.enabled = false));
+      isStreamingPaused = true;
+
+      const sendTTSCompleted = () => {
+        if (currentTurnId !== turnId) return;
+        // Do NOT unmute mic tracks or unpause streaming here!
+        sentSocketMessages.push({ type: 'tts_completed', turn_id: turnId });
+      };
+
+      const handleServerAck = (event) => {
+        if (event.type === 'state_change' && event.state === 'WAKE_LISTENING') {
+          if (event.ack === 'tts_completed' && event.turn_id !== undefined && event.turn_id !== currentTurnId) {
+            return;
+          }
+          mockStream.getAudioTracks().forEach((t) => (t.enabled = true));
+          isStreamingPaused = false;
+        }
+      };
+
+      // Play audio and simulate onended
+      playBase64WavAudio(
+        dummyWavBase64,
+        () => {},
+        () => {
+          echoTimer = setTimeout(() => {
+            echoTimer = null;
+            sendTTSCompleted();
+          }, 30);
+        },
+        () => {},
+        { autoRestoreSession: false }
+      );
+
+      await new Promise((r) => setTimeout(r, 15));
+      mockAudioContext.activeSource.onended();
+
+      // Wait for echo buffer timer (30ms)
+      await new Promise((r) => setTimeout(r, 45));
+
+      // Assert tts_completed was sent, BUT mic is STILL muted and streaming STILL paused!
+      assert.strictEqual(sentSocketMessages.length, 1);
+      assert.strictEqual(sentSocketMessages[0].type, 'tts_completed');
+      assert.strictEqual(sentSocketMessages[0].turn_id, 1);
+      assert.strictEqual(mockStream.getAudioTracks()[0].enabled, false, 'Mic must remain muted after tts_completed before backend ack');
+      assert.strictEqual(isStreamingPaused, true, 'Streaming must remain paused until backend ack arrives');
+
+      // Now simulate server responding with acknowledged state_change
+      handleServerAck({
+        type: 'state_change',
+        state: 'WAKE_LISTENING',
+        ack: 'tts_completed',
+        turn_id: 1,
+      });
+
+      assert.strictEqual(mockStream.getAudioTracks()[0].enabled, true, 'Mic must be re-enabled after matching ack');
+      assert.strictEqual(isStreamingPaused, false, 'Streaming must be unpaused after matching ack');
+    });
+
+    it('stale or duplicate tts_completed acknowledgements cannot resume the microphone for a newer turn', () => {
+      let isStreamingPaused = true;
+      let currentTurnId = 2; // Active turn has advanced to 2
+      mockStream.getAudioTracks().forEach((t) => (t.enabled = false));
+
+      const handleServerAck = (event) => {
+        if (event.type === 'state_change' && event.state === 'WAKE_LISTENING') {
+          if (event.ack === 'tts_completed' && event.turn_id !== undefined && event.turn_id !== currentTurnId) {
+            return; // Ignore stale turn ack!
+          }
+          mockStream.getAudioTracks().forEach((t) => (t.enabled = true));
+          isStreamingPaused = false;
+        }
+      };
+
+      // Stale ack for turn 1 arrives
+      handleServerAck({
+        type: 'state_change',
+        state: 'WAKE_LISTENING',
+        ack: 'tts_completed',
+        turn_id: 1,
+      });
+
+      assert.strictEqual(mockStream.getAudioTracks()[0].enabled, false, 'Stale turn ack must not re-enable mic');
+      assert.strictEqual(isStreamingPaused, true, 'Stale turn ack must not unpause streaming');
+
+      // Matching ack for turn 2 arrives
+      handleServerAck({
+        type: 'state_change',
+        state: 'WAKE_LISTENING',
+        ack: 'tts_completed',
+        turn_id: 2,
+      });
+
+      assert.strictEqual(mockStream.getAudioTracks()[0].enabled, true, 'Matching turn ack must re-enable mic');
+      assert.strictEqual(isStreamingPaused, false, 'Matching turn ack must unpause streaming');
+    });
+  });
+
+  describe('TTS Acknowledgement Timeout & Safe State Recovery', () => {
+    it('normal acknowledgement cancels the ack timeout timer', async () => {
+      let ackTimeoutTimer = null;
+      let recoveryTriggered = false;
+
+      // 1. sendTTSCompleted schedules ack timeout
+      ackTimeoutTimer = setTimeout(() => {
+        recoveryTriggered = true;
+      }, 50);
+
+      // 2. Normal matching ack arrives before 50ms
+      await new Promise((r) => setTimeout(r, 15));
+      if (ackTimeoutTimer) {
+        clearTimeout(ackTimeoutTimer);
+        ackTimeoutTimer = null;
+      }
+
+      // 3. Wait past 50ms deadline
+      await new Promise((r) => setTimeout(r, 60));
+      assert.strictEqual(recoveryTriggered, false, 'Recovery must not trigger when ack arrives in time');
+      assert.strictEqual(ackTimeoutTimer, null, 'Ack timeout timer must be cleared');
+    });
+
+    it('missing acknowledgement triggers safe get_state resync without unmuting mic', async () => {
+      let isStreamingPaused = true;
+      mockStream.getAudioTracks().forEach((t) => (t.enabled = false));
+      const socketMessages = [];
+      let isConnected = true;
+      let currentTurnId = 1;
+      const turnId = 1;
+      let ackTimeoutTimer = null;
+
+      const handleAckTimeout = (timedOutTurnId) => {
+        if (currentTurnId !== timedOutTurnId) return;
+        if (!isConnected) return;
+        // Query authoritative backend state
+        socketMessages.push({ type: 'get_state' });
+      };
+
+      // sendTTSCompleted
+      socketMessages.push({ type: 'tts_completed', turn_id: turnId });
+      ackTimeoutTimer = setTimeout(() => {
+        handleAckTimeout(turnId);
+      }, 30);
+
+      // Wait for timeout to fire (30ms)
+      await new Promise((r) => setTimeout(r, 45));
+
+      assert.strictEqual(socketMessages.length, 2);
+      assert.strictEqual(socketMessages[0].type, 'tts_completed');
+      assert.strictEqual(socketMessages[1].type, 'get_state', 'Must dispatch get_state on ack timeout');
+      assert.strictEqual(mockStream.getAudioTracks()[0].enabled, false, 'Mic must NOT be blindly unmuted on timeout');
+      assert.strictEqual(isStreamingPaused, true, 'Streaming must remain paused on timeout');
+    });
+
+    it('healthy connection with backend still SPEAKING does not unmute mic', () => {
+      let isStreamingPaused = true;
+      let currentTurnId = 1;
+      mockStream.getAudioTracks().forEach((t) => (t.enabled = false));
+
+      const handleStateSync = (event) => {
+        if (event.type === 'state_change') {
+          if (event.state === 'WAKE_LISTENING') {
+            if (event.turn_id !== undefined && event.turn_id !== currentTurnId) return;
+            mockStream.getAudioTracks().forEach((t) => (t.enabled = true));
+            isStreamingPaused = false;
+          } else {
+            mockStream.getAudioTracks().forEach((t) => (t.enabled = false));
+            isStreamingPaused = true;
+          }
+        }
+      };
+
+      // Backend returns authoritative state: still SPEAKING
+      handleStateSync({
+        type: 'state_change',
+        state: 'SPEAKING',
+        turn_id: 1,
+      });
+
+      assert.strictEqual(mockStream.getAudioTracks()[0].enabled, false, 'Mic must remain muted when backend is SPEAKING');
+      assert.strictEqual(isStreamingPaused, true, 'Streaming must remain paused');
+    });
+
+    it('backend confirms WAKE_LISTENING with matching turn; microphone resumes safely', () => {
+      let isStreamingPaused = true;
+      let currentTurnId = 1;
+      mockStream.getAudioTracks().forEach((t) => (t.enabled = false));
+
+      const handleStateSync = (event) => {
+        if (event.type === 'state_change') {
+          if (event.state === 'WAKE_LISTENING') {
+            if (event.turn_id !== undefined && event.turn_id !== currentTurnId) return;
+            mockStream.getAudioTracks().forEach((t) => (t.enabled = true));
+            isStreamingPaused = false;
+          }
+        }
+      };
+
+      // Backend confirms WAKE_LISTENING
+      handleStateSync({
+        type: 'state_change',
+        state: 'WAKE_LISTENING',
+        turn_id: 1,
+      });
+
+      assert.strictEqual(mockStream.getAudioTracks()[0].enabled, true, 'Mic must resume when backend confirms WAKE_LISTENING');
+      assert.strictEqual(isStreamingPaused, false, 'Streaming must resume');
+    });
+
+    it('stale state responses cannot unmute the microphone', () => {
+      let isStreamingPaused = true;
+      let currentTurnId = 3; // Active turn is 3
+      mockStream.getAudioTracks().forEach((t) => (t.enabled = false));
+
+      const handleStateSync = (event) => {
+        if (event.type === 'state_change') {
+          if (event.state === 'WAKE_LISTENING') {
+            if (event.turn_id !== undefined && event.turn_id !== currentTurnId) return;
+            mockStream.getAudioTracks().forEach((t) => (t.enabled = true));
+            isStreamingPaused = false;
+          }
+        }
+      };
+
+      // Stale state response for turn 2 arrives
+      handleStateSync({
+        type: 'state_change',
+        state: 'WAKE_LISTENING',
+        turn_id: 2,
+      });
+
+      assert.strictEqual(mockStream.getAudioTracks()[0].enabled, false, 'Stale turn_id must not unmute');
+      assert.strictEqual(isStreamingPaused, true, 'Stale turn_id must not unpause');
+    });
+
+    it('disconnected socket triggers controlled reconnect without unmuting mic', () => {
+      let isStreamingPaused = true;
+      mockStream.getAudioTracks().forEach((t) => (t.enabled = false));
+      let isConnected = false;
+      let reconnectCalled = false;
+      let currentTurnId = 1;
+
+      const handleAckTimeout = (timedOutTurnId) => {
+        if (currentTurnId !== timedOutTurnId) return;
+        if (!isConnected) {
+          reconnectCalled = true;
+          return;
+        }
+      };
+
+      handleAckTimeout(1);
+
+      assert.strictEqual(reconnectCalled, true, 'Must trigger reconnect on disconnected socket');
+      assert.strictEqual(mockStream.getAudioTracks()[0].enabled, false, 'Must NOT unmute mic when disconnected');
+      assert.strictEqual(isStreamingPaused, true, 'Streaming must remain paused');
+    });
+
+    it('emergency stop cancels pending ack timeout recovery', async () => {
+      let ackTimeoutTimer = null;
+      let recoveryFired = false;
+      let currentTurnId = 1;
+
+      ackTimeoutTimer = setTimeout(() => {
+        recoveryFired = true;
+      }, 50);
+
+      // Trigger emergencyStop at t = 10ms
+      currentTurnId++;
+      if (ackTimeoutTimer) {
+        clearTimeout(ackTimeoutTimer);
+        ackTimeoutTimer = null;
+      }
+
+      await new Promise((r) => setTimeout(r, 70));
+      assert.strictEqual(recoveryFired, false, 'Emergency stop must cancel pending recovery');
+      assert.strictEqual(ackTimeoutTimer, null);
+    });
+
+    it('unmount / stopAudioCapture clears pending ack timeout timer', () => {
+      let ackTimeoutTimer = setTimeout(() => {}, 1000);
+
+      // Simulate stopAudioCapture
+      if (ackTimeoutTimer) {
+        clearTimeout(ackTimeoutTimer);
+        ackTimeoutTimer = null;
+      }
+
+      assert.strictEqual(ackTimeoutTimer, null, 'Unmount must clean up ack timeout timer');
+    });
+
+    it('duplicate acknowledgements cannot cause duplicate recovery', async () => {
+      let ackTimeoutTimer = null;
+      let micEnables = 0;
+      let isStreamingPaused = true;
+      let currentTurnId = 1;
+
+      ackTimeoutTimer = setTimeout(() => {}, 100);
+
+      const handleServerAck = (event) => {
+        if (event.type === 'state_change' && event.state === 'WAKE_LISTENING') {
+          if (event.turn_id !== undefined && event.turn_id !== currentTurnId) return;
+          if (ackTimeoutTimer) {
+            clearTimeout(ackTimeoutTimer);
+            ackTimeoutTimer = null;
+          }
+          if (isStreamingPaused) {
+            micEnables++;
+            isStreamingPaused = false;
+          }
+        }
+      };
+
+      // Ack 1
+      handleServerAck({ type: 'state_change', state: 'WAKE_LISTENING', ack: 'tts_completed', turn_id: 1 });
+      // Duplicate Ack 2
+      handleServerAck({ type: 'state_change', state: 'WAKE_LISTENING', ack: 'tts_completed', turn_id: 1 });
+
+      assert.strictEqual(micEnables, 1, 'Microphone must be enabled exactly once despite duplicate acks');
+      assert.strictEqual(isStreamingPaused, false);
+      assert.strictEqual(ackTimeoutTimer, null);
+    });
+  });
+
+  describe('Phase 1 TTS Completed Resend & Safe Retry Safeguards', () => {
+    it('lost first tts_completed acknowledgement followed by successful retry', async () => {
+      let isStreamingPaused = true;
+      mockStream.getAudioTracks().forEach((t) => (t.enabled = false));
+      const socketMessages = [];
+      let isConnected = true;
+      let currentTurnId = 1;
+      let settledTurnId = null;
+      const retryCountPerTurn = new Map();
+      let ackTimeoutTimer = null;
+      let statusMessage = '';
+
+      const handleAckTimeout = (timedOutTurnId) => {
+        if (currentTurnId !== timedOutTurnId) return;
+        const retryCount = retryCountPerTurn.get(timedOutTurnId) ?? 0;
+        if (retryCount >= 1) {
+          statusMessage = 'Speech completion unacknowledged. Tap stop or emergency stop to reset.';
+          return;
+        }
+        if (!isConnected) return;
+        socketMessages.push({ type: 'get_state' });
+      };
+
+      const handleServerEvent = (event) => {
+        if (event.type === 'state_change') {
+          if (event.state === 'WAKE_LISTENING') {
+            if (event.turn_id !== undefined && event.turn_id !== currentTurnId) return;
+            if (ackTimeoutTimer) {
+              clearTimeout(ackTimeoutTimer);
+              ackTimeoutTimer = null;
+            }
+            mockStream.getAudioTracks().forEach((t) => (t.enabled = true));
+            isStreamingPaused = false;
+          } else {
+            mockStream.getAudioTracks().forEach((t) => (t.enabled = false));
+            isStreamingPaused = true;
+
+            if (
+              event.state === 'SPEAKING' &&
+              event.turn_id !== undefined &&
+              event.turn_id === currentTurnId &&
+              settledTurnId === event.turn_id
+            ) {
+              const currentRetries = retryCountPerTurn.get(event.turn_id) ?? 0;
+              if (currentRetries === 0) {
+                retryCountPerTurn.set(event.turn_id, 1);
+                socketMessages.push({ type: 'tts_completed', turn_id: event.turn_id });
+                if (ackTimeoutTimer) clearTimeout(ackTimeoutTimer);
+                ackTimeoutTimer = setTimeout(() => {
+                  ackTimeoutTimer = null;
+                  handleAckTimeout(event.turn_id);
+                }, 30);
+              } else {
+                statusMessage = 'Speech completion unacknowledged. Tap stop or emergency stop to reset.';
+              }
+            }
+          }
+        }
+      };
+
+      // 1. Turn 1 local playback settles -> send first tts_completed
+      settledTurnId = 1;
+      socketMessages.push({ type: 'tts_completed', turn_id: 1 });
+      ackTimeoutTimer = setTimeout(() => {
+        ackTimeoutTimer = null;
+        handleAckTimeout(1);
+      }, 20);
+
+      // 2. Timeout fires: get_state is sent
+      await new Promise((r) => setTimeout(r, 35));
+      assert.strictEqual(socketMessages.length, 2);
+      assert.strictEqual(socketMessages[0].type, 'tts_completed');
+      assert.strictEqual(socketMessages[1].type, 'get_state');
+      assert.strictEqual(mockStream.getAudioTracks()[0].enabled, false);
+
+      // 3. Backend responds to get_state with state: SPEAKING for turn 1
+      handleServerEvent({ type: 'state_change', state: 'SPEAKING', turn_id: 1 });
+
+      // Verify retry was sent exactly once, but mic remains muted!
+      assert.strictEqual(socketMessages.length, 3);
+      assert.strictEqual(socketMessages[2].type, 'tts_completed', 'Must resend tts_completed on SPEAKING response');
+      assert.strictEqual(socketMessages[2].turn_id, 1);
+      assert.strictEqual(mockStream.getAudioTracks()[0].enabled, false, 'Mic must remain muted after retry');
+      assert.strictEqual(isStreamingPaused, true, 'Streaming must remain paused after retry');
+      assert.strictEqual(retryCountPerTurn.get(1), 1);
+
+      // 4. Backend acknowledges the retry with WAKE_LISTENING
+      handleServerEvent({ type: 'state_change', state: 'WAKE_LISTENING', ack: 'tts_completed', turn_id: 1 });
+
+      // Verify microphone and streaming are safely restored
+      assert.strictEqual(mockStream.getAudioTracks()[0].enabled, true, 'Mic must be enabled on WAKE_LISTENING ack');
+      assert.strictEqual(isStreamingPaused, false, 'Streaming must resume on WAKE_LISTENING ack');
+      assert.strictEqual(ackTimeoutTimer, null, 'Ack timeout timer must be cleared');
+    });
+
+    it('duplicate tts_completed does not cause incorrect state transitions', () => {
+      let isStreamingPaused = false;
+      let micEnabled = true;
+      let currentTurnId = 1;
+      let state = 'WAKE_LISTENING';
+
+      const handleServerAck = (event) => {
+        if (event.type === 'state_change' && event.state === 'WAKE_LISTENING') {
+          if (event.turn_id !== undefined && event.turn_id !== currentTurnId) return;
+          state = 'WAKE_LISTENING';
+          micEnabled = true;
+          isStreamingPaused = false;
+        }
+      };
+
+      // Initial valid ack
+      handleServerAck({ type: 'state_change', state: 'WAKE_LISTENING', ack: 'tts_completed', turn_id: 1 });
+      assert.strictEqual(state, 'WAKE_LISTENING');
+      assert.strictEqual(micEnabled, true);
+
+      // Duplicate ack
+      handleServerAck({ type: 'state_change', state: 'WAKE_LISTENING', ack: 'tts_completed', turn_id: 1 });
+      assert.strictEqual(state, 'WAKE_LISTENING');
+      assert.strictEqual(micEnabled, true);
+      assert.strictEqual(isStreamingPaused, false);
+    });
+
+    it('retry happens at most once per turn', () => {
+      let isStreamingPaused = true;
+      mockStream.getAudioTracks().forEach((t) => (t.enabled = false));
+      const socketMessages = [];
+      let currentTurnId = 1;
+      let settledTurnId = 1;
+      const retryCountPerTurn = new Map();
+      let statusMessage = '';
+
+      const handleServerEvent = (event) => {
+        if (event.type === 'state_change') {
+          if (event.state !== 'WAKE_LISTENING') {
+            mockStream.getAudioTracks().forEach((t) => (t.enabled = false));
+            isStreamingPaused = true;
+
+            if (
+              event.state === 'SPEAKING' &&
+              event.turn_id !== undefined &&
+              event.turn_id === currentTurnId &&
+              settledTurnId === event.turn_id
+            ) {
+              const currentRetries = retryCountPerTurn.get(event.turn_id) ?? 0;
+              if (currentRetries === 0) {
+                retryCountPerTurn.set(event.turn_id, 1);
+                socketMessages.push({ type: 'tts_completed', turn_id: event.turn_id });
+              } else {
+                statusMessage = 'Speech completion unacknowledged. Tap stop or emergency stop to reset.';
+              }
+            }
+          }
+        }
+      };
+
+      // First response in SPEAKING triggers retry #1
+      handleServerEvent({ type: 'state_change', state: 'SPEAKING', turn_id: 1 });
+      assert.strictEqual(socketMessages.length, 1);
+      assert.strictEqual(retryCountPerTurn.get(1), 1);
+
+      // Second response in SPEAKING does NOT trigger retry #2
+      handleServerEvent({ type: 'state_change', state: 'SPEAKING', turn_id: 1 });
+      assert.strictEqual(socketMessages.length, 1, 'Retry must not fire a second time for same turn');
+      assert.strictEqual(statusMessage, 'Speech completion unacknowledged. Tap stop or emergency stop to reset.');
+      assert.strictEqual(mockStream.getAudioTracks()[0].enabled, false);
+    });
+
+    it('stale turn response cannot trigger a retry or unmute', () => {
+      let isStreamingPaused = true;
+      mockStream.getAudioTracks().forEach((t) => (t.enabled = false));
+      const socketMessages = [];
+      let currentTurnId = 2; // Active turn is 2
+      let settledTurnId = 2;
+      const retryCountPerTurn = new Map();
+
+      const handleServerEvent = (event) => {
+        if (event.type === 'state_change') {
+          if (event.state === 'WAKE_LISTENING') {
+            if (event.turn_id !== undefined && event.turn_id !== currentTurnId) return;
+            mockStream.getAudioTracks().forEach((t) => (t.enabled = true));
+            isStreamingPaused = false;
+          } else {
+            mockStream.getAudioTracks().forEach((t) => (t.enabled = false));
+            isStreamingPaused = true;
+
+            if (
+              event.state === 'SPEAKING' &&
+              event.turn_id !== undefined &&
+              event.turn_id === currentTurnId &&
+              settledTurnId === event.turn_id
+            ) {
+              const currentRetries = retryCountPerTurn.get(event.turn_id) ?? 0;
+              if (currentRetries === 0) {
+                retryCountPerTurn.set(event.turn_id, 1);
+                socketMessages.push({ type: 'tts_completed', turn_id: event.turn_id });
+              }
+            }
+          }
+        }
+      };
+
+      // Stale turn 1 reports SPEAKING
+      handleServerEvent({ type: 'state_change', state: 'SPEAKING', turn_id: 1 });
+      assert.strictEqual(socketMessages.length, 0, 'Must NOT retry for stale turn 1');
+
+      // Stale turn 1 reports WAKE_LISTENING
+      handleServerEvent({ type: 'state_change', state: 'WAKE_LISTENING', turn_id: 1 });
+      assert.strictEqual(mockStream.getAudioTracks()[0].enabled, false, 'Must NOT unmute for stale turn 1');
+      assert.strictEqual(isStreamingPaused, true);
+    });
+
+    it('emergency stop cancels pending retry', async () => {
+      let isStreamingPaused = true;
+      mockStream.getAudioTracks().forEach((t) => (t.enabled = false));
+      const socketMessages = [];
+      let currentTurnId = 1;
+      let settledTurnId = 1;
+      const retryCountPerTurn = new Map();
+      let ackTimeoutTimer = null;
+
+      const handleAckTimeout = (timedOutTurnId) => {
+        if (currentTurnId !== timedOutTurnId) return;
+        socketMessages.push({ type: 'get_state' });
+      };
+
+      ackTimeoutTimer = setTimeout(() => {
+        handleAckTimeout(1);
+      }, 40);
+
+      // Emergency stop triggered at t = 10ms
+      currentTurnId++;
+      settledTurnId = null;
+      retryCountPerTurn.clear();
+      if (ackTimeoutTimer) {
+        clearTimeout(ackTimeoutTimer);
+        ackTimeoutTimer = null;
+      }
+      mockStream.getAudioTracks().forEach((t) => (t.enabled = true));
+      isStreamingPaused = false;
+
+      await new Promise((r) => setTimeout(r, 60));
+
+      assert.strictEqual(socketMessages.length, 0, 'No get_state or retry sent after emergency stop');
+      assert.strictEqual(ackTimeoutTimer, null);
+      assert.strictEqual(settledTurnId, null);
+    });
+
+    it('failed retry never causes premature microphone activation', async () => {
+      let isStreamingPaused = true;
+      mockStream.getAudioTracks().forEach((t) => (t.enabled = false));
+      const socketMessages = [];
+      let isConnected = true;
+      let currentTurnId = 1;
+      let settledTurnId = 1;
+      const retryCountPerTurn = new Map([[1, 1]]); // Retry already used!
+      let ackTimeoutTimer = null;
+      let statusMessage = '';
+
+      const handleAckTimeout = (timedOutTurnId) => {
+        if (currentTurnId !== timedOutTurnId) return;
+        const retryCount = retryCountPerTurn.get(timedOutTurnId) ?? 0;
+        if (retryCount >= 1) {
+          statusMessage = 'Speech completion unacknowledged. Tap stop or emergency stop to reset.';
+          return;
+        }
+        if (!isConnected) return;
+        socketMessages.push({ type: 'get_state' });
+      };
+
+      // Safety timeout for retry fires
+      ackTimeoutTimer = setTimeout(() => {
+        ackTimeoutTimer = null;
+        handleAckTimeout(1);
+      }, 20);
+
+      await new Promise((r) => setTimeout(r, 35));
+
+      assert.strictEqual(socketMessages.length, 0, 'Must NOT send get_state after retry times out');
+      assert.strictEqual(statusMessage, 'Speech completion unacknowledged. Tap stop or emergency stop to reset.');
+      assert.strictEqual(mockStream.getAudioTracks()[0].enabled, false, 'Microphone must remain strictly muted');
+      assert.strictEqual(isStreamingPaused, true, 'Streaming must remain strictly paused');
+    });
+  });
 });

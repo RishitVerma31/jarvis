@@ -4,6 +4,7 @@ Manages bidirectional real-time audio streaming, wake-word detection,
 voice activity detection, speech-to-text, and conversational response dispatch.
 """
 
+import asyncio
 import base64
 import json
 import logging
@@ -34,6 +35,8 @@ async def handle_voice_websocket(websocket: WebSocket) -> None:
 
     current_state = "WAKE_LISTENING"
     current_session_id: str | None = None
+    current_turn_id = 0
+    processing_task: asyncio.Task[None] | None = None
 
     # Buffers (strictly in-memory bytearrays; no recordings stored on disk)
     wake_buffer = bytearray()
@@ -50,6 +53,145 @@ async def handle_voice_websocket(websocket: WebSocket) -> None:
         "state": current_state,
         "message": "Connected to Jarvis Voice. Listening for 'Hey Jarvis'.",
     })
+
+    async def _process_turn(turn_id: int, audio_bytes: bytes) -> None:
+        nonlocal current_state, current_session_id
+        try:
+            transcript, stt_latency = await voice_service.transcribe_pcm(audio_bytes)
+
+            if turn_id != current_turn_id:
+                logger.info("Discarding turn %d after STT; active turn is %d", turn_id, current_turn_id)
+                return
+
+            if not transcript or not transcript.strip():
+                logger.info("Transcription yielded empty text; returning to standby.")
+                await websocket.send_json({
+                    "type": "empty_speech",
+                    "message": "No intelligible speech detected.",
+                })
+                current_state = "WAKE_LISTENING"
+                await websocket.send_json({
+                    "type": "state_change",
+                    "state": current_state,
+                    "message": "Listening for 'Hey Jarvis'.",
+                })
+                return
+
+            await websocket.send_json({
+                "type": "transcription",
+                "text": transcript,
+                "latency_ms": stt_latency,
+            })
+
+            if turn_id != current_turn_id:
+                return
+
+            # Transition to PROCESSING
+            current_state = "PROCESSING"
+            await websocket.send_json({
+                "type": "state_change",
+                "state": current_state,
+                "message": "Jarvis is processing your request...",
+            })
+
+            # Generate unique session ID if not set
+            if not current_session_id:
+                current_session_id = f"voice-{int(time.time())}"
+
+            llm_start = time.perf_counter()
+            session_factory = get_session_factory()
+            async with session_factory() as db:
+                chat_service = ChatService(
+                    db=db,
+                    ollama_service=get_ollama_service(),
+                )
+                chat_res = await chat_service.process_chat(
+                    session_id=current_session_id,
+                    user_message=transcript,
+                )
+            llm_latency = (time.perf_counter() - llm_start) * 1000.0
+
+            if turn_id != current_turn_id:
+                logger.info("Discarding turn %d after LLM; active turn is %d", turn_id, current_turn_id)
+                return
+
+            logger.info(
+                "Voice turn complete: STT=%.1fms, LLM=%.1fms. Reply: '%s'",
+                stt_latency,
+                llm_latency,
+                chat_res.reply[:50],
+            )
+
+            # Kokoro TTS Synthesis (if enabled)
+            audio_b64: str | None = None
+            tts_latency: float | None = None
+            settings = get_settings()
+
+            if settings.ENABLE_KOKORO_TTS:
+                try:
+                    kokoro_service = get_kokoro_service(settings)
+                    wav_bytes, tts_lat = await kokoro_service.synthesize(
+                        chat_res.reply,
+                        voice=settings.KOKORO_VOICE,
+                        speed=settings.KOKORO_SPEED,
+                    )
+                    audio_b64 = base64.b64encode(wav_bytes).decode("ascii")
+                    tts_latency = tts_lat
+                except Exception as exc:
+                    logger.warning(
+                        "Kokoro TTS generation failed; proceeding with text-only reply: %s",
+                        exc,
+                    )
+
+            if turn_id != current_turn_id:
+                logger.info("Discarding turn %d after TTS; active turn is %d", turn_id, current_turn_id)
+                return
+
+            # Transition to SPEAKING
+            current_state = "SPEAKING"
+            response_payload: dict[str, Any] = {
+                "type": "chat_response",
+                "reply": chat_res.reply,
+                "user_message": transcript,
+                "session_id": chat_res.session_id,
+                "model": chat_res.model,
+                "created_at": chat_res.created_at.isoformat(),
+                "turn_id": turn_id,
+                "metrics": {
+                    "stt_latency_ms": stt_latency,
+                    "llm_latency_ms": llm_latency,
+                },
+            }
+            if audio_b64:
+                response_payload["audio"] = audio_b64
+                response_payload["audio_mime"] = "audio/wav"
+                response_payload["voice"] = settings.KOKORO_VOICE
+                if tts_latency is not None:
+                    response_payload["metrics"]["tts_latency_ms"] = tts_latency
+
+            await websocket.send_json(response_payload)
+            await websocket.send_json({
+                "type": "state_change",
+                "state": current_state,
+                "message": "Speaking response...",
+            })
+
+        except asyncio.CancelledError:
+            logger.info("Voice turn processing task cancelled (turn_id=%d).", turn_id)
+            raise
+        except Exception as exc:
+            logger.error("Error in voice turn processing (turn_id=%d): %s", turn_id, exc, exc_info=True)
+            if turn_id == current_turn_id:
+                current_state = "WAKE_LISTENING"
+                try:
+                    await websocket.send_json({"type": "error", "message": "Voice processing error."})
+                    await websocket.send_json({
+                        "type": "state_change",
+                        "state": current_state,
+                        "message": "Listening for 'Hey Jarvis'.",
+                    })
+                except Exception:
+                    pass
 
     try:
         while True:
@@ -69,6 +211,10 @@ async def handle_voice_websocket(websocket: WebSocket) -> None:
                         logger.info("Voice session set to: %s", current_session_id)
 
                     elif event_type == "mute":
+                        if processing_task and not processing_task.done():
+                            processing_task.cancel()
+                            processing_task = None
+                        current_turn_id += 1
                         current_state = "MUTED"
                         wake_buffer.clear()
                         speech_buffer.clear()
@@ -90,6 +236,10 @@ async def handle_voice_websocket(websocket: WebSocket) -> None:
 
                     elif event_type in ("emergency_stop", "stop_speaking"):
                         logger.info("Emergency stop triggered by client.")
+                        if processing_task and not processing_task.done():
+                            processing_task.cancel()
+                            processing_task = None
+                        current_turn_id += 1
                         wake_buffer.clear()
                         speech_buffer.clear()
                         vad_buffer.clear()
@@ -101,15 +251,40 @@ async def handle_voice_websocket(websocket: WebSocket) -> None:
                         })
 
                     elif event_type in ("tts_completed", "resume"):
-                        # Handshake: Client finished speaking assistant reply, resuming standby
+                        client_turn_id = data.get("turn_id")
+                        # Validate turn_id if supplied
+                        if client_turn_id is not None and client_turn_id != current_turn_id:
+                            logger.info(
+                                "Ignoring stale %s for turn %s (current turn: %s)",
+                                event_type,
+                                client_turn_id,
+                                current_turn_id,
+                            )
+                            continue
+
+                        # Idempotent reset to standby
                         wake_buffer.clear()
                         speech_buffer.clear()
                         vad_buffer.clear()
                         current_state = "WAKE_LISTENING"
-                        await websocket.send_json({
+
+                        response = {
                             "type": "state_change",
                             "state": current_state,
                             "message": "Standing by. Listening for 'Hey Jarvis'.",
+                        }
+                        if client_turn_id is not None:
+                            response["ack"] = "tts_completed"
+                            response["turn_id"] = client_turn_id
+
+                        await websocket.send_json(response)
+
+                    elif event_type in ("get_state", "sync_state"):
+                        await websocket.send_json({
+                            "type": "state_change",
+                            "state": current_state,
+                            "turn_id": current_turn_id,
+                            "message": f"State sync: {current_state}",
                         })
 
                     elif event_type == "ping":
@@ -123,8 +298,8 @@ async def handle_voice_websocket(websocket: WebSocket) -> None:
             if "bytes" in msg and msg["bytes"]:
                 raw_bytes = msg["bytes"]
 
-                # In MUTED, PROCESSING, or SPEAKING states, ignore audio to eliminate loopback
-                if current_state in ("MUTED", "PROCESSING", "SPEAKING"):
+                # In MUTED, TRANSCRIBING, PROCESSING, or SPEAKING states, ignore audio to eliminate loopback
+                if current_state in ("MUTED", "TRANSCRIBING", "PROCESSING", "SPEAKING"):
                     continue
 
                 if current_state == "WAKE_LISTENING":
@@ -189,6 +364,9 @@ async def handle_voice_websocket(websocket: WebSocket) -> None:
 
                         # Transition to TRANSCRIBING
                         current_state = "TRANSCRIBING"
+                        current_turn_id += 1
+                        turn_id = current_turn_id
+
                         await websocket.send_json({
                             "type": "state_change",
                             "state": current_state,
@@ -199,108 +377,12 @@ async def handle_voice_websocket(websocket: WebSocket) -> None:
                         speech_buffer.clear()
                         vad_buffer.clear()
 
-                        transcript, stt_latency = await voice_service.transcribe_pcm(audio_to_transcribe)
+                        # Ensure previous processing task is cancelled if still active
+                        if processing_task and not processing_task.done():
+                            processing_task.cancel()
 
-                        if not transcript or not transcript.strip():
-                            logger.info("Transcription yielded empty text; returning to standby.")
-                            await websocket.send_json({
-                                "type": "empty_speech",
-                                "message": "No intelligible speech detected.",
-                            })
-                            current_state = "WAKE_LISTENING"
-                            await websocket.send_json({
-                                "type": "state_change",
-                                "state": current_state,
-                                "message": "Listening for 'Hey Jarvis'.",
-                            })
-                            continue
-
-                        await websocket.send_json({
-                            "type": "transcription",
-                            "text": transcript,
-                            "latency_ms": stt_latency,
-                        })
-
-                        # Transition to PROCESSING
-                        current_state = "PROCESSING"
-                        await websocket.send_json({
-                            "type": "state_change",
-                            "state": current_state,
-                            "message": "Jarvis is processing your request...",
-                        })
-
-                        # Generate unique session ID if not set
-                        if not current_session_id:
-                            current_session_id = f"voice-{int(time.time())}"
-
-                        llm_start = time.perf_counter()
-                        session_factory = get_session_factory()
-                        async with session_factory() as db:
-                            chat_service = ChatService(
-                                db=db,
-                                ollama_service=get_ollama_service(),
-                            )
-                            chat_res = await chat_service.process_chat(
-                                session_id=current_session_id,
-                                user_message=transcript,
-                            )
-                        llm_latency = (time.perf_counter() - llm_start) * 1000.0
-
-                        logger.info(
-                            "Voice turn complete: STT=%.1fms, LLM=%.1fms. Reply: '%s'",
-                            stt_latency,
-                            llm_latency,
-                            chat_res.reply[:50],
-                        )
-
-                        # Kokoro TTS Synthesis (if enabled)
-                        audio_b64: str | None = None
-                        tts_latency: float | None = None
-                        settings = get_settings()
-
-                        if settings.ENABLE_KOKORO_TTS:
-                            try:
-                                kokoro_service = get_kokoro_service(settings)
-                                wav_bytes, tts_lat = await kokoro_service.synthesize(
-                                    chat_res.reply,
-                                    voice=settings.KOKORO_VOICE,
-                                    speed=settings.KOKORO_SPEED,
-                                )
-                                audio_b64 = base64.b64encode(wav_bytes).decode("ascii")
-                                tts_latency = tts_lat
-                            except Exception as exc:
-                                logger.warning(
-                                    "Kokoro TTS generation failed; proceeding with text-only reply: %s",
-                                    exc,
-                                )
-
-                        # Transition to SPEAKING
-                        current_state = "SPEAKING"
-                        response_payload: dict[str, Any] = {
-                            "type": "chat_response",
-                            "reply": chat_res.reply,
-                            "user_message": transcript,
-                            "session_id": chat_res.session_id,
-                            "model": chat_res.model,
-                            "created_at": chat_res.created_at.isoformat(),
-                            "metrics": {
-                                "stt_latency_ms": stt_latency,
-                                "llm_latency_ms": llm_latency,
-                            },
-                        }
-                        if audio_b64:
-                            response_payload["audio"] = audio_b64
-                            response_payload["audio_mime"] = "audio/wav"
-                            response_payload["voice"] = settings.KOKORO_VOICE
-                            if tts_latency is not None:
-                                response_payload["metrics"]["tts_latency_ms"] = tts_latency
-
-                        await websocket.send_json(response_payload)
-                        await websocket.send_json({
-                            "type": "state_change",
-                            "state": current_state,
-                            "message": "Speaking response...",
-                        })
+                        # Launch asynchronous turn processing task
+                        processing_task = asyncio.create_task(_process_turn(turn_id, audio_to_transcribe))
 
                     # Timeout: Wake word fired, but no user speech within 4 seconds
                     elif not speech_started and total_recording_time >= INITIAL_SPEECH_TIMEOUT_SECONDS:
@@ -322,6 +404,16 @@ async def handle_voice_websocket(websocket: WebSocket) -> None:
             await websocket.send_json({"type": "error", "message": "Internal voice processing error."})
         except Exception:
             pass
+    finally:
+        if processing_task and not processing_task.done():
+            processing_task.cancel()
+            try:
+                await processing_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        wake_buffer.clear()
+        speech_buffer.clear()
+        vad_buffer.clear()
 
 
 @router.websocket("/ws/voice")

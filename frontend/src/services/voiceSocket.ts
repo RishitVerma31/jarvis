@@ -145,6 +145,19 @@ export class VoiceSocket {
     this.notifyConnectionState(false);
   }
 
+  public reconnect(): void {
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+    if (this.ws) {
+      this.ws.close();
+      this.ws = null;
+    }
+    this.reconnectAttempts = 0;
+    this.connect();
+  }
+
   public sendAudio(pcmData: Int16Array | ArrayBuffer): void {
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
       this.ws.send(pcmData);

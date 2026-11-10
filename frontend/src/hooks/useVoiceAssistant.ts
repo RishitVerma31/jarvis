@@ -86,8 +86,11 @@ export function useVoiceAssistant() {
   const isCapturingRef = useRef<boolean>(false);
   const isStreamingPausedRef = useRef<boolean>(false);
   const echoBufferTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const ackTimeoutTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const activeAudioPlaybackStopRef = useRef<(() => void) | null>(null);
   const currentTurnIdRef = useRef<number>(0);
+  const settledTurnIdRef = useRef<number | null>(null);
+  const retryCountPerTurnRef = useRef<Map<number, number>>(new Map());
 
   // Keep ref to latest session ID without triggering effect re-execution
   const activeSessionIdRef = useRef<string | null>(activeSessionId);
@@ -115,13 +118,25 @@ export function useVoiceAssistant() {
     isAudioUnlocked,
   } = useSpeechSynthesis();
 
+  const isBrowserSpeakingRef = useRef(isBrowserSpeaking);
+  useEffect(() => {
+    isBrowserSpeakingRef.current = isBrowserSpeaking;
+  }, [isBrowserSpeaking]);
+
   // Stop all active Kokoro audio playback and browser speech synthesis cleanly
   const cancelAllSpeech = useCallback(() => {
     currentTurnIdRef.current++;
+    settledTurnIdRef.current = null;
+    retryCountPerTurnRef.current.clear();
 
     if (echoBufferTimerRef.current) {
       clearTimeout(echoBufferTimerRef.current);
       echoBufferTimerRef.current = null;
+    }
+
+    if (ackTimeoutTimerRef.current) {
+      clearTimeout(ackTimeoutTimerRef.current);
+      ackTimeoutTimerRef.current = null;
     }
 
     if (activeAudioPlaybackStopRef.current) {
@@ -182,6 +197,46 @@ export function useVoiceAssistant() {
     }
   }, [activeSessionId]);
 
+  // Safe state resynchronization if backend tts_completed acknowledgement times out
+  const handleAckTimeout = useCallback(
+    (timedOutTurnId: number) => {
+      // 1. Guard against stale or already-settled turns
+      if (currentTurnIdRef.current !== timedOutTurnId) {
+        return;
+      }
+
+      const retryCount = retryCountPerTurnRef.current.get(timedOutTurnId) ?? 0;
+      if (retryCount >= 1) {
+        console.warn(
+          `[VoiceAssistant] TTS completion acknowledgement retry timed out for turn ${timedOutTurnId}. Maintaining safe muted state.`
+        );
+        setStatusMessage('Speech completion unacknowledged. Tap stop or emergency stop to reset.');
+        return;
+      }
+
+      console.warn(
+        `[VoiceAssistant] TTS completed acknowledgement timed out for turn ${timedOutTurnId}. Initiating safe state resynchronization.`
+      );
+
+      // 2. Do NOT blindly enable microphone tracks or resume PCM transmission!
+      // 3. Inspect socket connection health
+      if (!voiceSocketRef.current?.isConnected()) {
+        console.warn(
+          '[VoiceAssistant] Voice WebSocket is disconnected during ack timeout. Performing controlled reconnection.'
+        );
+        cancelAllSpeech();
+        voiceSocketRef.current?.reconnect();
+        return;
+      }
+
+      // 4. Connection is healthy: query authoritative backend state
+      voiceSocketRef.current.sendMessage({
+        type: 'get_state',
+      });
+    },
+    [cancelAllSpeech]
+  );
+
   // Handle server events
   const handleServerEvent = useCallback(
     (event: VoiceServerEvent) => {
@@ -190,6 +245,100 @@ export function useVoiceAssistant() {
           setVoiceState(event.state);
           if (event.message) {
             setStatusMessage(event.message);
+          }
+
+          // Immediately pause PCM transmission when recording ends and processing begins
+          if (event.state === 'TRANSCRIBING' || event.state === 'PROCESSING') {
+            isStreamingPausedRef.current = true;
+          }
+
+          // Acknowledged standby transition: restore audio session, mic tracks, and unpause streaming
+          if (event.state === 'WAKE_LISTENING') {
+            // Guard against stale turn acknowledgements
+            if (
+              event.turn_id !== undefined &&
+              event.turn_id !== currentTurnIdRef.current
+            ) {
+              break;
+            }
+
+            // Clear any pending ack timeout timer
+            if (ackTimeoutTimerRef.current) {
+              clearTimeout(ackTimeoutTimerRef.current);
+              ackTimeoutTimerRef.current = null;
+            }
+
+            // Restore iOS audio session to play-and-record for voice input
+            setAudioSessionType('play-and-record');
+
+            // Re-enable hardware microphone track
+            if (mediaStreamRef.current) {
+              mediaStreamRef.current.getAudioTracks().forEach((track) => {
+                track.enabled = true;
+              });
+            }
+
+            // Resume PCM streaming to WebSocket
+            isStreamingPausedRef.current = false;
+          } else {
+            // If backend reports any non-standby state (SPEAKING, PROCESSING, TRANSCRIBING, MUTED),
+            // ensure microphone remains muted and PCM streaming remains paused!
+            if (
+              mediaStreamRef.current &&
+              (event.state === 'SPEAKING' ||
+                event.state === 'PROCESSING' ||
+                event.state === 'TRANSCRIBING' ||
+                event.state === 'MUTED')
+            ) {
+              mediaStreamRef.current.getAudioTracks().forEach((track) => {
+                track.enabled = false;
+              });
+            }
+            isStreamingPausedRef.current = true;
+
+            // Phase 1 Recovery Correction:
+            // If backend reports SPEAKING for the exact turn whose local playback has already settled,
+            // resend tts_completed exactly once for that turn.
+            if (
+              event.state === 'SPEAKING' &&
+              event.turn_id !== undefined &&
+              event.turn_id === currentTurnIdRef.current &&
+              settledTurnIdRef.current === event.turn_id &&
+              !isAudioPlaying() &&
+              !isBrowserSpeakingRef.current
+            ) {
+              const currentRetries = retryCountPerTurnRef.current.get(event.turn_id) ?? 0;
+              if (currentRetries === 0) {
+                retryCountPerTurnRef.current.set(event.turn_id, 1);
+                console.warn(
+                  `[VoiceAssistant] Backend still in SPEAKING for settled turn ${event.turn_id}; retrying tts_completed (attempt 1/1).`
+                );
+                if (voiceSocketRef.current?.isConnected()) {
+                  voiceSocketRef.current.sendMessage({
+                    type: 'tts_completed',
+                    turn_id: event.turn_id,
+                  });
+                }
+
+                // Arm bounded timeout for the retry acknowledgement
+                if (ackTimeoutTimerRef.current) {
+                  clearTimeout(ackTimeoutTimerRef.current);
+                }
+                const ackTimeoutMs =
+                  (globalThis as unknown as { __JARVIS_ACK_TIMEOUT_MS__?: number })
+                    .__JARVIS_ACK_TIMEOUT_MS__ ?? 2500;
+                const turnToRetry = event.turn_id;
+                ackTimeoutTimerRef.current = setTimeout(() => {
+                  ackTimeoutTimerRef.current = null;
+                  handleAckTimeout(turnToRetry);
+                }, ackTimeoutMs);
+              } else {
+                console.warn(
+                  `[VoiceAssistant] Backend still in SPEAKING for turn ${event.turn_id} after retry; retaining safe muted state.`
+                );
+                setStatusMessage('Speech completion unacknowledged. Tap stop or emergency stop to reset.');
+              }
+            }
           }
           break;
 
@@ -257,7 +406,8 @@ export function useVoiceAssistant() {
 
           // Cancel any previous speech or audio playback and assign new turn ID
           cancelAllSpeech();
-          const turnId = currentTurnIdRef.current;
+          const turnId = event.turn_id ?? currentTurnIdRef.current;
+          currentTurnIdRef.current = turnId;
 
           // Mute hardware microphone track before starting speech to release acoustic loopback
           if (mediaStreamRef.current) {
@@ -273,23 +423,29 @@ export function useVoiceAssistant() {
             if (currentTurnIdRef.current !== turnId) return;
             if (ttsCompletedDispatched) return;
             ttsCompletedDispatched = true;
+            settledTurnIdRef.current = turnId;
             activeAudioPlaybackStopRef.current = null;
-            isStreamingPausedRef.current = false;
 
-            // 1. Restore iOS audio session to play-and-record for voice input
-            setAudioSessionType('play-and-record');
-
-            // 2. Re-enable hardware microphone track after speech completes
-            if (mediaStreamRef.current) {
-              mediaStreamRef.current.getAudioTracks().forEach((track) => {
-                track.enabled = true;
+            // Signal tts_completed to backend with active turnId.
+            // Hardware mic and PCM streaming remain paused until backend acknowledges WAKE_LISTENING!
+            if (voiceSocketRef.current?.isConnected()) {
+              voiceSocketRef.current.sendMessage({
+                type: 'tts_completed',
+                turn_id: turnId,
               });
             }
 
-            // 3. Signal tts_completed to backend
-            if (voiceSocketRef.current?.isConnected()) {
-              voiceSocketRef.current.sendMessage({ type: 'tts_completed' });
+            // Schedule bounded safety timeout waiting for backend acknowledgement
+            if (ackTimeoutTimerRef.current) {
+              clearTimeout(ackTimeoutTimerRef.current);
             }
+            const ackTimeoutMs =
+              (globalThis as unknown as { __JARVIS_ACK_TIMEOUT_MS__?: number })
+                .__JARVIS_ACK_TIMEOUT_MS__ ?? 2500;
+            ackTimeoutTimerRef.current = setTimeout(() => {
+              ackTimeoutTimerRef.current = null;
+              handleAckTimeout(turnId);
+            }, ackTimeoutMs);
           };
 
           // 300ms acoustic echo suppression buffer delay
@@ -381,12 +537,19 @@ export function useVoiceAssistant() {
           break;
       }
     },
-    [cancelAllSpeech, queryClient, setActiveSessionId, speak]
+    [cancelAllSpeech, handleAckTimeout, queryClient, setActiveSessionId, speak]
   );
 
   // Teardown microphone and audio pipeline cleanly
   const stopAudioCapture = useCallback(() => {
     isCapturingRef.current = false;
+    settledTurnIdRef.current = null;
+    retryCountPerTurnRef.current.clear();
+
+    if (ackTimeoutTimerRef.current) {
+      clearTimeout(ackTimeoutTimerRef.current);
+      ackTimeoutTimerRef.current = null;
+    }
 
     if (scriptProcessorRef.current) {
       scriptProcessorRef.current.onaudioprocess = null;

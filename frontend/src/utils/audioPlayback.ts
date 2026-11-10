@@ -154,6 +154,7 @@ function decodeAudioDataSafe(ctx: AudioContext, buffer: ArrayBuffer): Promise<Au
 
 export interface PlayAudioOptions {
   autoRestoreSession?: boolean;
+  watchdogDelayMs?: number;
 }
 
 /**
@@ -164,7 +165,7 @@ export interface PlayAudioOptions {
  * @param onStart Optional callback invoked when playback begins
  * @param onEnd Optional callback invoked when playback finishes naturally
  * @param onError Optional callback invoked if decoding or playback fails
- * @param options Optional playback configuration (e.g. autoRestoreSession)
+ * @param options Optional playback configuration (e.g. autoRestoreSession, watchdogDelayMs)
  * @returns A cancellation function that immediately stops playback without triggering onEnd
  */
 export function playBase64WavAudio(
@@ -181,8 +182,17 @@ export function playBase64WavAudio(
   let isCancelled = false;
   let hasSettled = false;
   let sourceNode: AudioBufferSourceNode | null = null;
+  let watchdogTimer: ReturnType<typeof setTimeout> | null = null;
+
+  const clearWatchdog = () => {
+    if (watchdogTimer !== null) {
+      clearTimeout(watchdogTimer);
+      watchdogTimer = null;
+    }
+  };
 
   const safeEnd = () => {
+    clearWatchdog();
     if (hasSettled) return;
     hasSettled = true;
     isCurrentlyPlaying = false;
@@ -194,6 +204,7 @@ export function playBase64WavAudio(
   };
 
   const safeError = (err: unknown) => {
+    clearWatchdog();
     if (hasSettled) return;
     hasSettled = true;
     isCurrentlyPlaying = false;
@@ -205,6 +216,7 @@ export function playBase64WavAudio(
   };
 
   const cancelPlayback = () => {
+    clearWatchdog();
     if (hasSettled || isCancelled) return;
     isCancelled = true;
     hasSettled = true;
@@ -285,6 +297,7 @@ export function playBase64WavAudio(
       sourceNode = source;
 
       source.onended = () => {
+        clearWatchdog();
         sourceNode = null;
         if (!isCancelled) {
           safeEnd();
@@ -294,6 +307,32 @@ export function playBase64WavAudio(
       isCurrentlyPlaying = true;
       onStart?.();
       source.start(0);
+
+      // Duration-based safety watchdog (audio duration + dynamic grace period)
+      const durationSec = audioBuffer.duration || 0;
+      const watchdogTimeoutMs =
+        options?.watchdogDelayMs ??
+        (Math.round(durationSec * 1000) + Math.max(1200, Math.round(durationSec * 150)));
+
+      watchdogTimer = setTimeout(() => {
+        watchdogTimer = null;
+        if (!isCancelled && !hasSettled) {
+          console.warn(
+            `[AudioPlayback] Safety watchdog fired: AudioBufferSourceNode.onended missed after ${watchdogTimeoutMs}ms.`
+          );
+          if (sourceNode) {
+            try {
+              sourceNode.onended = null;
+              sourceNode.stop();
+              sourceNode.disconnect();
+            } catch {
+              // Ignore if already stopped
+            }
+            sourceNode = null;
+          }
+          safeEnd();
+        }
+      }, watchdogTimeoutMs);
     } catch (err) {
       if (!isCancelled) {
         safeError(err);

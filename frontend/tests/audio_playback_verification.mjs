@@ -440,4 +440,91 @@ describe('Kokoro Web Audio Playback Utility', () => {
       assert.strictEqual(isAudioPlaying(), false);
     });
   });
+
+  describe('Playback Safety Watchdog & Settlement Guards', () => {
+    it('watchdog fires and triggers safeEnd when source.onended is never invoked', async () => {
+      const mockCtx = new MockAudioContext({ initialState: 'running' });
+      setPlaybackAudioContextForTesting(mockCtx);
+
+      let started = false;
+      let ended = false;
+      let endedCount = 0;
+
+      playBase64WavAudio(
+        dummyValidWavBase64,
+        () => { started = true; },
+        () => {
+          ended = true;
+          endedCount++;
+        },
+        () => {},
+        { autoRestoreSession: false, watchdogDelayMs: 40 }
+      );
+
+      await new Promise((r) => setTimeout(r, 15));
+      assert.strictEqual(started, true, 'Playback should have started');
+      assert.strictEqual(ended, false, 'Playback should not have ended before watchdog delay');
+      assert.strictEqual(isAudioPlaying(), true);
+
+      // Do NOT call mockCtx.activeSource.onended() — simulate dropped browser callback
+      // Wait for watchdog to trigger (40ms deadline)
+      await new Promise((r) => setTimeout(r, 50));
+
+      assert.strictEqual(ended, true, 'Watchdog must trigger safeEnd when onended is missing');
+      assert.strictEqual(endedCount, 1, 'onEnd must fire exactly once');
+      assert.strictEqual(mockCtx.activeSource.stopped, true, 'Watchdog must stop the source node');
+      assert.strictEqual(isAudioPlaying(), false, 'Playing flag must be cleared');
+    });
+
+    it('watchdog is disarmed on natural source.onended completion without duplicate onEnd calls', async () => {
+      const mockCtx = new MockAudioContext({ initialState: 'running' });
+      setPlaybackAudioContextForTesting(mockCtx);
+
+      let endedCount = 0;
+
+      playBase64WavAudio(
+        dummyValidWavBase64,
+        undefined,
+        () => { endedCount++; },
+        undefined,
+        { autoRestoreSession: false, watchdogDelayMs: 60 }
+      );
+
+      await new Promise((r) => setTimeout(r, 15));
+
+      // Natural completion before watchdog
+      mockCtx.activeSource.onended();
+      assert.strictEqual(endedCount, 1, 'Natural completion fires onEnd once');
+
+      // Wait beyond the 60ms watchdog deadline
+      await new Promise((r) => setTimeout(r, 80));
+      assert.strictEqual(endedCount, 1, 'Watchdog must be cancelled and not fire duplicate onEnd');
+    });
+
+    it('manual stopAudioPlayback disarms watchdog and suppresses onEnd', async () => {
+      const mockCtx = new MockAudioContext({ initialState: 'running' });
+      setPlaybackAudioContextForTesting(mockCtx);
+
+      let ended = false;
+
+      playBase64WavAudio(
+        dummyValidWavBase64,
+        undefined,
+        () => { ended = true; },
+        undefined,
+        { autoRestoreSession: false, watchdogDelayMs: 40 }
+      );
+
+      await new Promise((r) => setTimeout(r, 15));
+
+      // Explicit cancellation
+      stopAudioPlayback();
+      assert.strictEqual(ended, false, 'Manual stop must not trigger onEnd');
+      assert.strictEqual(isAudioPlaying(), false);
+
+      // Wait beyond watchdog deadline
+      await new Promise((r) => setTimeout(r, 60));
+      assert.strictEqual(ended, false, 'Cancelled playback watchdog must not trigger onEnd');
+    });
+  });
 });

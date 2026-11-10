@@ -23,6 +23,8 @@ export interface VoiceStateChangeEvent {
   type: 'state_change';
   state: VoiceState;
   message?: string;
+  ack?: string;
+  turn_id?: number;
 }
 
 export interface VoiceWakeDetectedEvent {
@@ -43,6 +45,7 @@ export interface VoiceChatResponseEvent {
   session_id: string;
   model?: string;
   created_at: string;
+  turn_id?: number;
   audio?: string;
   audio_mime?: string;
   voice?: string;
@@ -78,7 +81,9 @@ export type VoiceClientMessage =
   | { type: 'unmute' }
   | { type: 'emergency_stop' }
   | { type: 'stop_speaking' }
-  | { type: 'tts_completed' }
+  | { type: 'tts_completed'; turn_id?: number }
+  | { type: 'get_state' }
+  | { type: 'sync_state'; turn_id?: number }
   | { type: 'resume' }
   | { type: 'ping' };
 

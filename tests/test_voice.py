@@ -336,3 +336,199 @@ def test_voice_websocket_lifecycle_and_event_order():
             pong = ws.receive_json()
             assert pong["type"] == "pong"
 
+
+def test_voice_websocket_receives_control_messages_during_long_processing():
+    """Verify WebSocket receive loop stays responsive (answering pings) during simulated slow processing."""
+    mock_vs, mock_chat_res = _get_mock_voice_services(reply="Story completed.")
+
+    async def slow_process_chat(*args, **kwargs):
+        await asyncio.sleep(0.15)
+        return mock_chat_res
+
+    client = TestClient(app)
+    with patch("backend.routers.voice.SILENCE_TIMEOUT_SECONDS", 0.05), \
+         patch("backend.routers.voice.get_voice_service", return_value=mock_vs), \
+         patch("backend.routers.voice.ChatService.process_chat", side_effect=slow_process_chat), \
+         patch("backend.routers.voice.get_settings", return_value=Settings(ENABLE_KOKORO_TTS=False)):
+        with client.websocket_connect(f"/ws/voice?ticket={get_test_ws_ticket()}") as ws:
+            ws.receive_json()  # WAKE_LISTENING
+
+            # Wake word + speech
+            ws.send_bytes(bytes(2560))
+            assert ws.receive_json()["type"] == "wake_detected"
+            assert ws.receive_json()["state"] == "RECORDING"
+
+            ws.send_bytes(bytes(960))
+            time.sleep(0.06)
+            ws.send_bytes(bytes(960))
+
+            # Transcribing event
+            t_state = ws.receive_json()
+            assert t_state["state"] == "TRANSCRIBING"
+
+            # STT finishes quickly, then PROCESSING starts and enters slow Ollama
+            transcription = ws.receive_json()
+            assert transcription["type"] == "transcription"
+
+            p_state = ws.receive_json()
+            assert p_state["state"] == "PROCESSING"
+
+            # While LLM is actively processing in background task, send ping frames
+            ws.send_json({"type": "ping"})
+            pong1 = ws.receive_json()
+            assert pong1["type"] == "pong"
+
+            ws.send_json({"type": "ping"})
+            pong2 = ws.receive_json()
+            assert pong2["type"] == "pong"
+
+            # Verify chat_response eventually arrives after background processing completes
+            chat_res = ws.receive_json()
+            assert chat_res["type"] == "chat_response"
+            assert chat_res["reply"] == "Story completed."
+
+            speaking = ws.receive_json()
+            assert speaking["state"] == "SPEAKING"
+
+
+def test_voice_websocket_emergency_stop_cancels_active_processing_task():
+    """Verify emergency stop safely cancels in-flight turn processing and prevents stale speech."""
+    mock_vs, mock_chat_res = _get_mock_voice_services()
+
+    async def slow_chat(*args, **kwargs):
+        await asyncio.sleep(0.5)
+        return mock_chat_res
+
+    client = TestClient(app)
+    with patch("backend.routers.voice.SILENCE_TIMEOUT_SECONDS", 0.05), \
+         patch("backend.routers.voice.get_voice_service", return_value=mock_vs), \
+         patch("backend.routers.voice.ChatService.process_chat", side_effect=slow_chat), \
+         patch("backend.routers.voice.get_settings", return_value=Settings(ENABLE_KOKORO_TTS=False)):
+        with client.websocket_connect(f"/ws/voice?ticket={get_test_ws_ticket()}") as ws:
+            ws.receive_json()  # WAKE_LISTENING
+
+            ws.send_bytes(bytes(2560))
+            ws.receive_json()  # wake_detected
+            ws.receive_json()  # RECORDING
+
+            ws.send_bytes(bytes(960))
+            time.sleep(0.06)
+            ws.send_bytes(bytes(960))
+
+            assert ws.receive_json()["state"] == "TRANSCRIBING"
+            assert ws.receive_json()["type"] == "transcription"
+            assert ws.receive_json()["state"] == "PROCESSING"
+
+            # Trigger emergency stop while in PROCESSING
+            ws.send_json({"type": "emergency_stop"})
+            stopped_state = ws.receive_json()
+            assert stopped_state == {
+                "type": "state_change",
+                "state": "WAKE_LISTENING",
+                "message": "Stopped. Listening for 'Hey Jarvis'.",
+            }
+
+            # Wait to ensure the cancelled background task never emits chat_response or SPEAKING
+            time.sleep(0.2)
+            ws.send_json({"type": "ping"})
+            pong = ws.receive_json()
+            assert pong["type"] == "pong"
+
+
+def test_voice_websocket_tts_completed_handshake_with_turn_id():
+    """Verify TTS completed handshake includes turn_id and returns matching acknowledgement."""
+    mock_vs, mock_chat_res = _get_mock_voice_services()
+    client = TestClient(app)
+    with patch("backend.routers.voice.SILENCE_TIMEOUT_SECONDS", 0.05), \
+         patch("backend.routers.voice.get_voice_service", return_value=mock_vs), \
+         patch("backend.routers.voice.ChatService.process_chat", new_callable=AsyncMock, return_value=mock_chat_res), \
+         patch("backend.routers.voice.get_settings", return_value=Settings(ENABLE_KOKORO_TTS=False)):
+        with client.websocket_connect(f"/ws/voice?ticket={get_test_ws_ticket()}") as ws:
+            ws.receive_json()  # WAKE_LISTENING
+            chat_res, speaking = _simulate_voice_turn(ws)
+
+            turn_id = chat_res.get("turn_id")
+            assert turn_id is not None
+            assert speaking["state"] == "SPEAKING"
+
+            # Send acknowledged tts_completed with turn_id
+            ws.send_json({"type": "tts_completed", "turn_id": turn_id})
+            res = ws.receive_json()
+            assert res["type"] == "state_change"
+            assert res["state"] == "WAKE_LISTENING"
+            assert res["ack"] == "tts_completed"
+            assert res["turn_id"] == turn_id
+
+
+def test_voice_websocket_tts_completed_stale_and_duplicate_idempotency():
+    """Verify stale tts_completed messages are ignored, and duplicates are handled idempotently."""
+    mock_vs, mock_chat_res = _get_mock_voice_services()
+    client = TestClient(app)
+    with patch("backend.routers.voice.SILENCE_TIMEOUT_SECONDS", 0.05), \
+         patch("backend.routers.voice.get_voice_service", return_value=mock_vs), \
+         patch("backend.routers.voice.ChatService.process_chat", new_callable=AsyncMock, return_value=mock_chat_res), \
+         patch("backend.routers.voice.get_settings", return_value=Settings(ENABLE_KOKORO_TTS=False)):
+        with client.websocket_connect(f"/ws/voice?ticket={get_test_ws_ticket()}") as ws:
+            ws.receive_json()
+            chat_res, _ = _simulate_voice_turn(ws)
+            active_turn = chat_res["turn_id"]
+
+            # 1. Send stale turn_id (e.g. 999) while in SPEAKING
+            ws.send_json({"type": "tts_completed", "turn_id": 999})
+            # Verify socket is still responsive and still in SPEAKING by sending ping
+            ws.send_json({"type": "ping"})
+            pong = ws.receive_json()
+            assert pong["type"] == "pong"
+
+            # 2. Send valid turn_id
+            ws.send_json({"type": "tts_completed", "turn_id": active_turn})
+            ack1 = ws.receive_json()
+            assert ack1["ack"] == "tts_completed"
+            assert ack1["turn_id"] == active_turn
+            assert ack1["state"] == "WAKE_LISTENING"
+
+            # 3. Send duplicate tts_completed with same turn_id
+            ws.send_json({"type": "tts_completed", "turn_id": active_turn})
+            ack2 = ws.receive_json()
+            assert ack2["ack"] == "tts_completed"
+            assert ack2["turn_id"] == active_turn
+            assert ack2["state"] == "WAKE_LISTENING"
+
+
+def test_voice_websocket_pcm_dropped_during_processing_and_speaking():
+    """Verify binary PCM is ignored during TRANSCRIBING, PROCESSING, and SPEAKING."""
+    mock_vs, mock_chat_res = _get_mock_voice_services()
+    client = TestClient(app)
+    with patch("backend.routers.voice.SILENCE_TIMEOUT_SECONDS", 0.05), \
+         patch("backend.routers.voice.get_voice_service", return_value=mock_vs), \
+         patch("backend.routers.voice.ChatService.process_chat", new_callable=AsyncMock, return_value=mock_chat_res), \
+         patch("backend.routers.voice.get_settings", return_value=Settings(ENABLE_KOKORO_TTS=False)):
+        with client.websocket_connect(f"/ws/voice?ticket={get_test_ws_ticket()}") as ws:
+            ws.receive_json()
+            chat_res, speaking = _simulate_voice_turn(ws)
+            assert speaking["state"] == "SPEAKING"
+
+            # Flood PCM frames during SPEAKING
+            for _ in range(10):
+                ws.send_bytes(bytes(2560))
+
+            # Send ping to verify socket remains healthy and PCM frames were simply dropped
+            ws.send_json({"type": "ping"})
+            pong = ws.receive_json()
+            assert pong["type"] == "pong"
+
+
+def test_voice_websocket_get_state_resync_non_destructive():
+    """Verify get_state returns authoritative state and turn_id without mutating active turn."""
+    client = TestClient(app)
+    with client.websocket_connect(f"/ws/voice?ticket={get_test_ws_ticket()}") as ws:
+        init = ws.receive_json()
+        assert init["state"] == "WAKE_LISTENING"
+
+        # Query state on standby
+        ws.send_json({"type": "get_state"})
+        res = ws.receive_json()
+        assert res["type"] == "state_change"
+        assert res["state"] == "WAKE_LISTENING"
+        assert res["turn_id"] == 0
+
