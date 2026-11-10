@@ -91,6 +91,7 @@ export function useVoiceAssistant() {
   const activeAudioPlaybackStopRef = useRef<(() => void) | null>(null);
   const currentTurnIdRef = useRef<number>(0);
   const playbackGenerationRef = useRef<number>(0);
+  const wakeMuteUntilRef = useRef<number>(0);
   const settledTurnIdRef = useRef<number | null>(null);
   const retryCountPerTurnRef = useRef<Map<number, number>>(new Map());
   const hasInitializedStartupRef = useRef<boolean>(false);
@@ -129,6 +130,7 @@ export function useVoiceAssistant() {
   // Stop all active Kokoro audio playback and browser speech synthesis cleanly
   const cancelAllSpeech = useCallback(() => {
     playbackGenerationRef.current++;
+    wakeMuteUntilRef.current = 0;
     settledTurnIdRef.current = null;
     retryCountPerTurnRef.current.clear();
 
@@ -380,6 +382,8 @@ export function useVoiceAssistant() {
           setIsFollowUp(false);
           setVoiceState('WAKE_DETECTED');
           setStatusMessage(`"Hey Jarvis" detected! (${Math.round(event.score * 100)}% match)`);
+          // Suppress mic streaming during wake chime playback (450ms) to prevent acoustic loopback
+          wakeMuteUntilRef.current = Date.now() + 450;
           playJarvisWakeChime();
           break;
 
@@ -582,6 +586,7 @@ export function useVoiceAssistant() {
   // Teardown microphone and audio pipeline cleanly
   const stopAudioCapture = useCallback(() => {
     isCapturingRef.current = false;
+    wakeMuteUntilRef.current = 0;
     settledTurnIdRef.current = null;
     retryCountPerTurnRef.current.clear();
 
@@ -662,7 +667,12 @@ export function useVoiceAssistant() {
           e.outputBuffer.getChannelData(ch).fill(0);
         }
 
-        if (!isVoiceModeActiveRef.current || isVoiceMutedRef.current || isStreamingPausedRef.current) {
+        if (
+          !isVoiceModeActiveRef.current ||
+          isVoiceMutedRef.current ||
+          isStreamingPausedRef.current ||
+          Date.now() < wakeMuteUntilRef.current
+        ) {
           setAudioLevel(0);
           return;
         }

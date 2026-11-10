@@ -257,6 +257,7 @@ class VoiceService:
             wakeword_models=[str(hey_jarvis_path)],
             melspec_model_path=str(melspec_path),
             embedding_model_path=str(embedding_path),
+            vad_threshold=0.5,
             inference_framework="onnx",
         )
         keys = list(self.wakeword_model.models.keys())
@@ -352,6 +353,9 @@ class VoiceService:
         try:
             if hasattr(self, "wakeword_model") and self.wakeword_model is not None:
                 self.wakeword_model.reset()
+                if hasattr(self.wakeword_model, "vad") and self.wakeword_model.vad is not None:
+                    self.wakeword_model.vad.reset_states()
+                    self.wakeword_model.vad.prediction_buffer.clear()
         except Exception as exc:
             logger.warning("Error resetting openWakeWord model: %s", exc)
 
