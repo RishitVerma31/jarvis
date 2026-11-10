@@ -16,6 +16,7 @@ export const VoiceControls: React.FC = () => {
     errorMessage,
     isVoiceModeActive,
     isVoiceMuted,
+    isFollowUp,
     unlockAudio,
     testSpeech,
     setVoiceModeActive,
@@ -32,6 +33,15 @@ export const VoiceControls: React.FC = () => {
   const getStateBadge = () => {
     switch (voiceState) {
       case 'WAKE_LISTENING':
+        if (isFollowUp) {
+          return (
+            <span className="flex items-center gap-1.5 rounded-full border border-emerald-500/40 bg-emerald-950/40 px-2 sm:px-2.5 py-0.5 text-xs font-medium text-emerald-300">
+              <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-emerald-400 shrink-0" />
+              <span className="hidden sm:inline">Follow-up active (5s)</span>
+              <span className="sm:hidden">Follow-up</span>
+            </span>
+          );
+        }
         return (
           <span className="flex items-center gap-1.5 rounded-full border border-cyan-500/30 bg-cyan-950/40 px-2 sm:px-2.5 py-0.5 text-xs font-medium text-cyan-300">
             <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-cyan-400 shrink-0" />

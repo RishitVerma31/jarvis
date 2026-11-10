@@ -1404,4 +1404,177 @@ describe('Kokoro Voice Assistant Integration (Milestone 2, Step 2)', () => {
       assert.strictEqual(state.sentAudioPackets.length, 1, 'Only the frame from RECORDING should have been sent');
     });
   });
+
+  describe('Phase 1 Conversation Lifecycle: 5-Second Follow-Up Window & Reset Protections', () => {
+    function createFollowUpHarness() {
+      const state = {
+        voiceState: 'STANDBY',
+        statusMessage: '',
+        isFollowUp: false,
+        isStreamingPaused: false,
+        micTracks: [{ enabled: true }],
+      };
+
+      const handleServerEvent = (event) => {
+        switch (event.type) {
+          case 'state_change':
+            state.voiceState = event.state;
+            if (event.message) state.statusMessage = event.message;
+            state.isFollowUp = Boolean(event.follow_up);
+            if (event.state === 'WAKE_LISTENING' || event.state === 'RECORDING') {
+              state.micTracks.forEach((t) => { t.enabled = true; });
+              state.isStreamingPaused = false;
+            } else {
+              if (event.state === 'SPEAKING' || event.state === 'MUTED') {
+                state.micTracks.forEach((t) => { t.enabled = false; });
+              }
+              state.isStreamingPaused = true;
+            }
+            break;
+          case 'wake_detected':
+            state.isFollowUp = false;
+            state.voiceState = 'WAKE_DETECTED';
+            break;
+          case 'chat_response':
+            state.isFollowUp = false;
+            state.voiceState = 'SPEAKING';
+            break;
+          case 'empty_speech':
+            state.isFollowUp = false;
+            break;
+          case 'error':
+            state.isFollowUp = false;
+            state.voiceState = 'ERROR';
+            break;
+        }
+      };
+
+      const emergencyStop = () => {
+        state.isFollowUp = false;
+        state.voiceState = 'WAKE_LISTENING';
+        state.statusMessage = 'Emergency stop triggered. Standing by.';
+      };
+
+      const stopSpeaking = () => {
+        state.isFollowUp = false;
+        state.voiceState = 'WAKE_LISTENING';
+        state.statusMessage = 'Standing by. Listening for "Hey Jarvis".';
+      };
+
+      return { state, handleServerEvent, emergencyStop, stopSpeaking };
+    }
+
+    it('1. tts_completed acknowledgement arms follow-up mode with active streaming', () => {
+      const { state, handleServerEvent } = createFollowUpHarness();
+      handleServerEvent({
+        type: 'state_change',
+        state: 'WAKE_LISTENING',
+        message: 'Listening for follow-up (5s)...',
+        ack: 'tts_completed',
+        turn_id: 1,
+        follow_up: true,
+      });
+
+      assert.strictEqual(state.voiceState, 'WAKE_LISTENING');
+      assert.strictEqual(state.isFollowUp, true);
+      assert.strictEqual(state.isStreamingPaused, false);
+      assert.strictEqual(state.micTracks[0].enabled, true);
+      assert.strictEqual(state.statusMessage, 'Listening for follow-up (5s)...');
+    });
+
+    it('2. follow-up expiration returns to standby without streaming disruption', () => {
+      const { state, handleServerEvent } = createFollowUpHarness();
+      handleServerEvent({
+        type: 'state_change',
+        state: 'WAKE_LISTENING',
+        message: 'Listening for follow-up (5s)...',
+        follow_up: true,
+      });
+      assert.strictEqual(state.isFollowUp, true);
+
+      handleServerEvent({
+        type: 'state_change',
+        state: 'WAKE_LISTENING',
+        message: "Listening for 'Hey Jarvis'.",
+        follow_up: false,
+      });
+      assert.strictEqual(state.isFollowUp, false);
+      assert.strictEqual(state.voiceState, 'WAKE_LISTENING');
+      assert.strictEqual(state.isStreamingPaused, false);
+      assert.strictEqual(state.micTracks[0].enabled, true);
+      assert.strictEqual(state.statusMessage, "Listening for 'Hey Jarvis'.");
+    });
+
+    it('3. speech in follow-up transitions to RECORDING and clears follow-up flag', () => {
+      const { state, handleServerEvent } = createFollowUpHarness();
+      handleServerEvent({
+        type: 'state_change',
+        state: 'WAKE_LISTENING',
+        message: 'Listening for follow-up (5s)...',
+        follow_up: true,
+      });
+      assert.strictEqual(state.isFollowUp, true);
+
+      handleServerEvent({
+        type: 'state_change',
+        state: 'RECORDING',
+        message: 'Listening for your command...',
+      });
+      assert.strictEqual(state.isFollowUp, false);
+      assert.strictEqual(state.voiceState, 'RECORDING');
+      assert.strictEqual(state.isStreamingPaused, false);
+    });
+
+    it('4. emergency stop immediately cancels follow-up mode', () => {
+      const { state, handleServerEvent, emergencyStop } = createFollowUpHarness();
+      handleServerEvent({
+        type: 'state_change',
+        state: 'WAKE_LISTENING',
+        follow_up: true,
+      });
+      assert.strictEqual(state.isFollowUp, true);
+
+      emergencyStop();
+      assert.strictEqual(state.isFollowUp, false);
+      assert.strictEqual(state.voiceState, 'WAKE_LISTENING');
+    });
+
+    it('5. stopSpeaking immediately cancels follow-up mode', () => {
+      const { state, handleServerEvent, stopSpeaking } = createFollowUpHarness();
+      handleServerEvent({
+        type: 'state_change',
+        state: 'WAKE_LISTENING',
+        follow_up: true,
+      });
+      assert.strictEqual(state.isFollowUp, true);
+
+      stopSpeaking();
+      assert.strictEqual(state.isFollowUp, false);
+      assert.strictEqual(state.voiceState, 'WAKE_LISTENING');
+    });
+
+    it('6. empty_speech or error resets follow-up state', () => {
+      const { state, handleServerEvent } = createFollowUpHarness();
+      handleServerEvent({
+        type: 'state_change',
+        state: 'WAKE_LISTENING',
+        follow_up: true,
+      });
+      assert.strictEqual(state.isFollowUp, true);
+
+      handleServerEvent({ type: 'empty_speech', message: 'No speech detected.' });
+      assert.strictEqual(state.isFollowUp, false);
+
+      handleServerEvent({
+        type: 'state_change',
+        state: 'WAKE_LISTENING',
+        follow_up: true,
+      });
+      assert.strictEqual(state.isFollowUp, true);
+
+      handleServerEvent({ type: 'error', message: 'Voice processing error.' });
+      assert.strictEqual(state.isFollowUp, false);
+      assert.strictEqual(state.voiceState, 'ERROR');
+    });
+  });
 });

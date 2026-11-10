@@ -77,6 +77,7 @@ export function useVoiceAssistant() {
   const [audioLevel, setAudioLevel] = useState<number>(0);
   const [lastMetrics, setLastMetrics] = useState<VoiceMetrics | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [isFollowUp, setIsFollowUp] = useState<boolean>(false);
 
   const voiceSocketRef = useRef<VoiceSocket | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
@@ -157,6 +158,7 @@ export function useVoiceAssistant() {
 
   const handleStopSpeaking = useCallback(() => {
     cancelAllSpeech();
+    setIsFollowUp(false);
     if (voiceSocketRef.current?.isConnected()) {
       voiceSocketRef.current.sendMessage({ type: 'stop_speaking' });
     }
@@ -166,6 +168,7 @@ export function useVoiceAssistant() {
 
   const emergencyStop = useCallback(() => {
     cancelAllSpeech();
+    setIsFollowUp(false);
     if (voiceSocketRef.current?.isConnected()) {
       voiceSocketRef.current.sendMessage({ type: 'emergency_stop' });
     }
@@ -246,6 +249,7 @@ export function useVoiceAssistant() {
           if (event.message) {
             setStatusMessage(event.message);
           }
+          setIsFollowUp(Boolean(event.follow_up));
 
           // 1. States where microphone PCM streaming MUST remain active: WAKE_LISTENING, RECORDING
           if (event.state === 'WAKE_LISTENING' || event.state === 'RECORDING') {
@@ -345,6 +349,7 @@ export function useVoiceAssistant() {
           break;
 
         case 'wake_detected':
+          setIsFollowUp(false);
           setVoiceState('WAKE_DETECTED');
           setStatusMessage(`"Hey Jarvis" detected! (${Math.round(event.score * 100)}% match)`);
           playJarvisWakeChime();
@@ -355,6 +360,7 @@ export function useVoiceAssistant() {
           break;
 
         case 'chat_response': {
+          setIsFollowUp(false);
           setVoiceState('SPEAKING');
           const targetSessionId = event.session_id;
 
@@ -529,10 +535,12 @@ export function useVoiceAssistant() {
         }
 
         case 'empty_speech':
+          setIsFollowUp(false);
           setStatusMessage(event.message || 'No speech detected.');
           break;
 
         case 'error':
+          setIsFollowUp(false);
           setVoiceState('ERROR');
           setErrorMessage(event.message);
           cancelAllSpeech();
@@ -716,6 +724,7 @@ export function useVoiceAssistant() {
     isVoiceModeActive,
     isVoiceMuted,
     isAudioUnlocked,
+    isFollowUp,
     unlockAudio: handleUnlockAudio,
     testSpeech: handleTestSpeech,
     setVoiceModeActive,

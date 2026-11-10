@@ -25,6 +25,7 @@ export interface VoiceStateChangeEvent {
   message?: string;
   ack?: string;
   turn_id?: number;
+  follow_up?: boolean;
 }
 
 export interface VoiceWakeDetectedEvent {
@@ -84,6 +85,5 @@ export type VoiceClientMessage =
   | { type: 'tts_completed'; turn_id?: number }
   | { type: 'get_state' }
   | { type: 'sync_state'; turn_id?: number }
-  | { type: 'resume' }
   | { type: 'ping' };
 

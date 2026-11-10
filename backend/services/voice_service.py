@@ -18,6 +18,7 @@ import time
 from typing import Any
 import urllib.request
 import numpy as np
+import re
 import webrtcvad
 from openwakeword.model import Model
 import faster_whisper
@@ -34,6 +35,161 @@ MODEL_FILES = {
     "melspectrogram.onnx": f"{OPENWAKEWORD_RELEASE_URL}/melspectrogram.onnx",
     "embedding_model.onnx": f"{OPENWAKEWORD_RELEASE_URL}/embedding_model.onnx",
 }
+
+EXIT_COMMAND_PHRASES = frozenset({
+    "thank you",
+    "thanks",
+    "that's it",
+    "thats it",
+    "that's all",
+    "thats all",
+    "that is all",
+    "that is it",
+    "bye",
+    "goodbye",
+    "good bye",
+    "stop",
+    "go to standby",
+    "standby",
+    "sleep",
+})
+
+
+def compute_pcm_rms(pcm_bytes: bytes) -> float:
+    """Calculate the Root-Mean-Square (RMS) amplitude of 16-bit mono PCM audio.
+
+    Args:
+        pcm_bytes: 16-bit 16kHz mono PCM byte string.
+
+    Returns:
+        float: RMS amplitude level in range [0.0, 32767.0].
+    """
+    if not pcm_bytes or len(pcm_bytes) < 2:
+        return 0.0
+    aligned_len = len(pcm_bytes) - (len(pcm_bytes) % 2)
+    samples = np.frombuffer(pcm_bytes[:aligned_len], dtype=np.int16)
+    if len(samples) == 0:
+        return 0.0
+    return float(np.sqrt(np.mean(samples.astype(np.float64) ** 2)))
+
+
+def is_valid_transcript(text: str) -> bool:
+    """Validate that transcription contains meaningful alphanumeric content.
+
+    Rejects empty, whitespace-only, and punctuation-only output (e.g. '...', '....', '.', ',').
+    """
+    if not text or not text.strip():
+        return False
+    # Strip bracketed whisper tags e.g. [music], (silence)
+    cleaned = re.sub(r'\[.*?\]|\(.*?\)', '', text).strip()
+    if not cleaned:
+        return False
+    # Check for at least one alphanumeric character
+    alphanumeric = re.sub(r'[\W_]+', '', cleaned, flags=re.UNICODE)
+    return len(alphanumeric) > 0
+
+
+def is_exit_command(text: str) -> bool:
+    """Determine whether a transcript matches an explicit voice exit command.
+
+    Supported phrases:
+    - 'thank you' / 'thanks'
+    - 'that's it' / 'thats it'
+    - 'that's all' / 'thats all'
+    - 'bye' / 'goodbye' / 'good bye'
+    - 'stop'
+    - 'go to standby' / 'standby'
+    - 'sleep'
+
+    Rules:
+    - Normalizes case and punctuation.
+    - Requires complete phrase match.
+    - Disallows arbitrary substring matches (e.g. 'Please don't stop explaining' is NOT an exit).
+    - Allows optional leading/trailing conversational prefixes like 'jarvis stop' or 'ok thank you'.
+    """
+    if not text:
+        return False
+
+    cleaned = re.sub(r"[^\w\s']", '', text.lower()).strip()
+    cleaned = re.sub(r'\s+', ' ', cleaned)
+
+    if not cleaned:
+        return False
+
+    if cleaned in EXIT_COMMAND_PHRASES:
+        return True
+
+    words = cleaned.split()
+    if len(words) >= 2:
+        # Optional leading address words e.g. "jarvis stop", "ok thank you"
+        if words[0] in ("jarvis", "ok", "okay"):
+            remainder = " ".join(words[1:])
+            if remainder in EXIT_COMMAND_PHRASES:
+                return True
+        # Optional trailing address word e.g. "stop jarvis", "thank you jarvis"
+        if words[-1] in ("jarvis",):
+            remainder = " ".join(words[:-1])
+            if remainder in EXIT_COMMAND_PHRASES:
+                return True
+
+    return False
+
+
+def validate_audio_recording(
+    pcm_bytes: bytes,
+    speech_frames: int,
+    min_speech_frames: int = 4,
+    min_rms: float = 180.0,
+    speech_pcm_bytes: bytes | None = None,
+) -> tuple[bool, str]:
+    """Validate recorded audio before passing to STT and LLM.
+
+    Args:
+        pcm_bytes: Complete recorded PCM byte sequence (including trailing silence).
+        speech_frames: Number of 30ms frames classified as speech by VAD.
+        min_speech_frames: Minimum number of speech frames required (default: 4 frames = 120ms).
+        min_rms: Minimum RMS energy threshold required for active speech (default: 180.0).
+        speech_pcm_bytes: Optional byte sequence containing only the identified speech frames.
+            If omitted or empty, speech frames are extracted using WebRTC VAD from pcm_bytes.
+
+    Returns:
+        tuple[bool, str]: (is_valid, reason)
+    """
+    if not pcm_bytes:
+        return False, "Audio buffer is empty."
+
+    duration_sec = (len(pcm_bytes) // 2) / 16000.0
+    if duration_sec < 0.12:
+        return False, f"Audio duration too short ({duration_sec:.2f}s < 0.12s)."
+
+    if speech_frames < min_speech_frames:
+        return False, f"Insufficient speech frames detected by VAD ({speech_frames} < {min_speech_frames})."
+
+    # Calculate RMS over the identified speech frames rather than the whole buffer
+    # to avoid energy dilution by trailing silence
+    if speech_pcm_bytes and len(speech_pcm_bytes) >= 2:
+        speech_rms = compute_pcm_rms(speech_pcm_bytes)
+    else:
+        # Extract speech frames using WebRTC VAD from pcm_bytes
+        try:
+            vad = webrtcvad.Vad(2)
+            extracted_speech = bytearray()
+            # 960 bytes = 30ms at 16kHz mono 16-bit
+            for i in range(0, len(pcm_bytes) - (len(pcm_bytes) % 960), 960):
+                frame = pcm_bytes[i : i + 960]
+                if vad.is_speech(frame, 16000):
+                    extracted_speech.extend(frame)
+            if len(extracted_speech) >= 2:
+                speech_rms = compute_pcm_rms(bytes(extracted_speech))
+            else:
+                speech_rms = compute_pcm_rms(pcm_bytes)
+        except Exception:
+            speech_rms = compute_pcm_rms(pcm_bytes)
+
+    if speech_rms < min_rms:
+        return False, f"Audio RMS energy below threshold ({speech_rms:.1f} < {min_rms:.1f})."
+
+    return True, "Valid speech audio."
 
 
 def download_model_file(url: str, destination: Path) -> None:
